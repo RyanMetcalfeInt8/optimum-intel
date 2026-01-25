@@ -4377,8 +4377,8 @@ class MllamaOpenVINOConfig(BaseVLMOpenVINOConfig):
             inputs[f"past_key_values.{self_id}.value"] = {0: "batch_size", 2: "past_length"}
 
         for layer_idx in cross_layers:
-            inputs[f"cross_attn_key_values.{layer_idx}.key"]   = {0:"batch_size", 2:"cross_kv_len"}
-            inputs[f"cross_attn_key_values.{layer_idx}.value"] = {0:"batch_size", 2:"cross_kv_len"}
+            inputs[f"cross_attn.{layer_idx}.key"]   = {0:"batch_size", 2:"cross_kv_len"}
+            inputs[f"cross_attn.{layer_idx}.value"] = {0:"batch_size", 2:"cross_kv_len"}
 
         return inputs
 
@@ -4390,8 +4390,8 @@ class MllamaOpenVINOConfig(BaseVLMOpenVINOConfig):
         if b == VLMConfigBehavior.VISION_EMBEDDINGS.value:
             outs = {}
             for layer_idx in _mllama_cross_layers(cfg):
-                outs[f"cross_attn_key_values.{layer_idx}.key"] = {0: "batch_size", 2: "cross_kv_len"}
-                outs[f"cross_attn_key_values.{layer_idx}.value"] = {0: "batch_size", 2: "cross_kv_len"}
+                outs[f"cross_attn.{layer_idx}.key"] = {0: "batch_size", 2: "cross_kv_len"}
+                outs[f"cross_attn.{layer_idx}.value"] = {0: "batch_size", 2: "cross_kv_len"}
             return outs
 
         if b == VLMConfigBehavior.LANGUAGE.value:
