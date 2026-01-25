@@ -6178,6 +6178,161 @@ class Llama4TextModelPatcher(ModelPatcher):
         if is_transformers_version(">=", "4.56"):
             transformers.masking_utils.chunked_overlay = self.original_chunked_overlay
 
+def _mllama_vision_to_cross_kv_forward(self, pixel_values, aspect_ratio_ids, aspect_ratio_mask):
+    bsz = pixel_values.shape[0]
+
+    cross_attention_states = self.vision_model(pixel_values, aspect_ratio_ids, aspect_ratio_mask)[0]
+    cross_attention_states = self.model.multi_modal_projector(cross_attention_states).reshape(
+        -1, cross_attention_states.shape[-2], self.model.hidden_size
+    )
+
+    from transformers.models.llama.modeling_llama import repeat_kv
+
+    cross_kv = ()
+    for layer_idx in self.language_model.cross_attention_layers:
+        layer = self.language_model.layers[layer_idx]
+        cross_attn = layer.cross_attn
+        k = cross_attn.k_proj(cross_attention_states)
+        v = cross_attn.v_proj(cross_attention_states)
+        k = k.view(bsz, -1, cross_attn.num_key_value_heads, cross_attn.head_dim).transpose(1, 2)
+        v = v.view(bsz, -1, cross_attn.num_key_value_heads, cross_attn.head_dim).transpose(1, 2)
+        k = repeat_kv(k, cross_attn.num_key_value_groups)
+        v = repeat_kv(v, cross_attn.num_key_value_groups)
+        k = cross_attn.k_norm(k)
+        cross_kv += ((k, v),)
+    return cross_kv
+
+class MllamaVisionEmbeddingsModelPatcher(ModelPatcher):
+    def __enter__(self):
+        super().__enter__()
+        self._orig_forward = self._model.forward
+        self._model.forward = types.MethodType(_mllama_vision_to_cross_kv_forward, self._model)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._model.forward = self._orig_forward
+        return super().__exit__(exc_type, exc_value, traceback)
+
+def _mllama_cross_attn_sdpa_forward(
+    self,
+    hidden_states,
+    cross_attention_states=None,
+    past_key_value=None,
+    attention_mask=None,
+    use_cache=None,
+    cache_position=None,
+    **kwargs,
+):
+    bsz, q_len, _ = hidden_states.size()
+
+    query_states = self.q_proj(hidden_states)
+    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+    query_states = self.q_norm(query_states)
+
+    from transformers.models.llama.modeling_llama import repeat_kv
+
+    if cross_attention_states is not None:
+        key_states = self.k_proj(cross_attention_states)
+        value_states = self.v_proj(cross_attention_states)
+        key_states = key_states.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, -1, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+        key_states = self.k_norm(key_states)
+        if past_key_value is not None:
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, {"cache_position": cache_position}
+            )
+    elif past_key_value is not None and past_key_value.get_seq_length(self.layer_idx) != 0:
+        key_states = past_key_value.key_cache[self.layer_idx]
+        value_states = past_key_value.value_cache[self.layer_idx]
+    else:
+        raise ValueError("Cross attention needs either cross_attention_states or cached key/values.")
+
+    causal_mask = None
+    if attention_mask is not None:  # no matter the length, we just slice it
+        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query_states, key_states, value_states, attn_mask=causal_mask, dropout_p=0.0, is_causal=False
+    )
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, -1)
+    attn_output = self.o_proj(attn_output)
+    return attn_output, None
+
+def _mllama_language_forward_wrap(
+    self,
+    inputs_embeds=None,
+    attention_mask=None,
+    position_ids=None,
+    cross_attention_mask=None,
+    cache_position=None,
+    full_text_row_masked_out_mask=None,
+    past_key_values=None,
+    cross_attn_key_values=None,
+):
+    common_cache = []
+    self_cache_id = 0
+    cross_cache_id = 0
+    cross_layers = list(self.config.text_config.cross_attention_layers)
+
+    for layer_idx in range(len(self.language_model.layers)):
+        if layer_idx in cross_layers:
+            common_cache.append(cross_attn_key_values[cross_cache_id])
+            cross_cache_id += 1
+        else:
+            common_cache.append(past_key_values[self_cache_id])
+            self_cache_id += 1
+
+    common_cache = DynamicCache.from_legacy_cache(common_cache)
+
+    outputs = self.model.language_model(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        cross_attention_mask=cross_attention_mask,
+        full_text_row_masked_out_mask=full_text_row_masked_out_mask,
+        past_key_values=common_cache,
+        cache_position=cache_position,
+        use_cache=True,
+    )
+
+    logits = self.lm_head(outputs.last_hidden_state)
+
+    present_all = outputs.past_key_values.to_legacy_cache()
+    present_self = []
+    for layer_idx in range(len(self.language_model.layers)):
+        if layer_idx in cross_layers:
+            continue
+        present_self.append(present_all[layer_idx])
+
+    return logits, tuple(present_self)
+
+class MllamaLanguageModelPatcher(OVDecoderModelPatcher):
+    def __init__(self, config, model, model_kwargs=None):
+        self._orig_model_forward = model.forward
+        self._orig_cross_attn_forwards = {}
+
+        for layer_idx in range(model.language_model.config.num_hidden_layers):
+            if layer_idx in model.language_model.cross_attention_layers:
+                cross_attn = model.language_model.layers[layer_idx].cross_attn
+                self._orig_cross_attn_forwards[layer_idx] = cross_attn.forward
+                cross_attn.forward = types.MethodType(_mllama_cross_attn_sdpa_forward, cross_attn)
+
+        model.forward = types.MethodType(_mllama_language_forward_wrap, model)
+
+        super().__init__(config, model, model_kwargs=model_kwargs or {})
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._model.forward = self._orig_model_forward
+
+        for layer_idx, orig in self._orig_cross_attn_forwards.items():
+            cross_attn = self._model.language_model.layers[layer_idx].cross_attn
+            cross_attn.forward = orig
+
+        return super().__exit__(exc_type, exc_value, traceback)
+
 
 # Vectorized implementation of ConvSequenceTransform to avoid if-else branching
 class ConvSequenceTransform(torch.nn.Module):

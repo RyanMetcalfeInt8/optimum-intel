@@ -121,6 +121,8 @@ from .model_patcher import (
     MiniCPMVResamplerModelPatcher,
     MistralModelPatcher,
     MixtralModelPatcher,
+    MllamaVisionEmbeddingsModelPatcher,
+    MllamaLanguageModelPatcher,
     MPTModelPatcher,
     OVDecoderModelPatcher,
     OVSeq2SeqModelPatcher,
@@ -201,6 +203,10 @@ def init_model_configs():
         "AutoModelForCausalLM",
     )
     TasksManager._CUSTOM_CLASSES[("pt", "llama4", "image-text-to-text")] = (
+        "transformers",
+        "AutoModelForImageTextToText",
+    )
+    TasksManager._CUSTOM_CLASSES[("pt", "mllama", "image-text-to-text")] = (
         "transformers",
         "AutoModelForImageTextToText",
     )
@@ -4096,6 +4102,307 @@ class Llama4OpenVINOConfig(GotOCR2OpenVINOConfig):
             return super().patch_model_for_export(model, model_kwargs)
         return Llama4ImageEmbeddingsModelPatcher(self, model, model_kwargs)
 
+
+def _mllama_cross_layers(cfg) -> list[int]:
+    return list(getattr(cfg.text_config, "cross_attention_layers", []))
+
+def _mllama_self_layers(cfg) -> list[int]:
+    cross = set(_mllama_cross_layers(cfg))
+    return [i for i in range(cfg.text_config.num_hidden_layers) if i not in cross]
+
+def _mllama_cross_kv_len(cfg) -> int:
+    max_tiles = getattr(cfg.vision_config, "max_image_tiles", 4)
+    image_size = getattr(cfg.vision_config, "image_size", 560)
+    patch_size = getattr(cfg.vision_config, "patch_size", 14)
+    grid = image_size // patch_size
+    return max_tiles * (grid * grid + 1)
+
+class DummyMllamaVisionInputGenerator(DummyInputGenerator):
+    SUPPORTED_INPUT_NAMES = ("pixel_values", "aspect_ratio_ids", "aspect_ratio_mask")
+
+    def __init__(self, task, normalized_config, batch_size=1, **kwargs):
+        cfg = normalized_config.config
+        self.batch_size = batch_size
+        self.image_size = int(cfg.vision_config.image_size)
+        self.max_tiles = int(getattr(cfg.vision_config, "max_image_tiles", 4))
+        # mllama vision uses shape (B, num_images, tiles, 3, H, W)
+        self.num_images = int(kwargs.get("num_images", 1))
+
+    def generate(self, input_name: str, framework="pt", int_dtype="int64", float_dtype="fp32"):
+        if input_name == "pixel_values":
+            return self.random_float_tensor(
+                [self.batch_size, self.num_images, self.max_tiles, 3, self.image_size, self.image_size],
+                framework=framework,
+                dtype=float_dtype,
+            )
+
+        if input_name == "aspect_ratio_ids":
+            import torch
+            return torch.full((self.batch_size, self.num_images), 6, dtype=getattr(torch, int_dtype))
+
+        if input_name == "aspect_ratio_mask":
+            # shape (B, num_images, tiles)
+            return self.random_int_tensor(
+                [self.batch_size, self.num_images, self.max_tiles],
+                max_value=2,
+                framework=framework,
+                dtype=int_dtype,
+            )
+
+        raise ValueError(f"Unsupported input name for DummyMllamaVisionInputGenerator: {input_name}")
+
+class DummyMllamaVLLMInputGenerator(DummyTextInputGenerator):
+    SUPPORTED_INPUT_NAMES = (
+        "inputs_embeds",
+        "attention_mask",
+        "position_ids",
+        "cross_attention_mask",
+        "cache_position",
+        "full_text_row_masked_out_mask",
+        "past_key_values",
+        "cross_attn_key_values",
+    )
+
+    def __init__(self, task, normalized_config, batch_size=1, sequence_length=2, **kwargs):
+        cfg = normalized_config.config
+        self.cfg = cfg
+        self.batch_size = batch_size
+        self.sequence_length = sequence_length
+
+        self.cross_kv_len = _mllama_cross_kv_len(cfg)
+
+        self.num_heads = cfg.text_config.num_attention_heads
+        self.head_dim = cfg.text_config.hidden_size // self.num_heads
+
+        self.self_kv_heads = getattr(cfg.text_config, "num_key_value_heads", self.num_heads)
+        self.cross_kv_heads = self.num_heads
+
+        self.cross_layers = _mllama_cross_layers(cfg)
+        self.self_layers = _mllama_self_layers(cfg)
+
+    def generate(self, input_name: str, framework="pt", int_dtype="int64", float_dtype="fp32"):
+        import torch
+        past_len = self.sequence_length
+        q_len = self.sequence_length
+        total_len = past_len + q_len
+
+        if input_name == "inputs_embeds":
+            return self.random_float_tensor(
+                [self.batch_size, q_len, self.cfg.text_config.hidden_size],
+                framework=framework,
+                dtype=float_dtype,
+            )
+
+        if input_name == "attention_mask":
+            return torch.ones([self.batch_size, total_len], dtype=torch.int64)
+
+        if input_name == "cache_position":
+            return torch.arange(past_len, past_len + q_len, dtype=torch.int64)
+
+        if input_name == "position_ids":
+            pos = torch.arange(past_len, past_len + q_len, dtype=torch.int64)
+            return pos.unsqueeze(0).repeat(self.batch_size, 1)
+
+        if input_name == "cross_attention_mask":
+            return torch.zeros([self.batch_size, 1, q_len, self.cross_kv_len], dtype=torch.float32)
+
+        if input_name == "full_text_row_masked_out_mask":
+            return torch.ones([self.batch_size, 1, q_len, 1], dtype=torch.float32)
+
+        if input_name == "past_key_values":
+            kv = []
+            for _ in range(len(self.self_layers)):
+                k = self.random_float_tensor(
+                    [self.batch_size, self.self_kv_heads, past_len, self.head_dim],
+                    framework=framework,
+                    dtype=float_dtype,
+                )
+                v = self.random_float_tensor(
+                    [self.batch_size, self.self_kv_heads, past_len, self.head_dim],
+                    framework=framework,
+                    dtype=float_dtype,
+                )
+                kv.append((k, v))
+            return tuple(kv)
+
+        if input_name == "cross_attn_key_values":
+            kv = []
+            for _layer_idx in self.cross_layers:
+                k = self.random_float_tensor(
+                    [self.batch_size, self.cross_kv_heads, self.cross_kv_len, self.head_dim],
+                    framework=framework,
+                    dtype=float_dtype,
+                )
+                v = self.random_float_tensor(
+                    [self.batch_size, self.cross_kv_heads, self.cross_kv_len, self.head_dim],
+                    framework=framework,
+                    dtype=float_dtype,
+                )
+                kv.append((k, v))
+            return tuple(kv)
+
+        raise ValueError(f"Unsupported input name: {input_name}")
+
+@register_in_tasks_manager("mllama", "image-text-to-text", library_name="transformers")
+class MllamaOpenVINOConfig(BaseVLMOpenVINOConfig):
+    SUPPORTED_BEHAVIORS = [b.value for b in VLMConfigBehavior]
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyMllamaVisionInputGenerator, DummyMllamaVLLMInputGenerator)
+    SUPPORTS_PAST = True
+
+    def __init__(
+        self,
+        config: "PretrainedConfig",
+        task: str = "text-to-audio",
+        int_dtype: str = "int64",
+        float_dtype: str = "fp32",
+        use_past: bool = False,
+        behavior: SpeechT5ConfigBehavior = VLMConfigBehavior.VISION_EMBEDDINGS,
+        preprocessors: Optional[List[Any]] = None,
+    ):
+        super().__init__(config=config, int_dtype=int_dtype, float_dtype=float_dtype, behavior=behavior, preprocessors=preprocessors)
+        self.use_past = use_past
+
+    @staticmethod
+    def _as_behavior(behavior):
+        if isinstance(behavior, VLMConfigBehavior):
+            return behavior
+        if isinstance(behavior, str):
+            return VLMConfigBehavior(behavior)
+        return VLMConfigBehavior(getattr(behavior, "value", behavior))
+
+    def with_behavior(self, behavior):
+        if isinstance(behavior, str) and not isinstance(behavior, VLMConfigBehavior):
+            behavior = VLMConfigBehavior(behavior)
+
+        if behavior == VLMConfigBehavior.TEXT_EMBEDDINGS:
+            text_cfg = self._config.text_config
+            model_type = text_cfg.model_type
+            return get_vlm_text_embeddings_config("llama", text_cfg, self.int_dtype, self.float_dtype)
+
+        if behavior == VLMConfigBehavior.LANGUAGE:
+            return self.__class__(
+                self._config,
+                task=self.task,
+                int_dtype=self.int_dtype,
+                float_dtype=self.float_dtype,
+                use_past=True,
+                behavior=behavior,
+                preprocessors=self._preprocessors,
+            )
+
+        if behavior == VLMConfigBehavior.VISION_EMBEDDINGS:
+            return self.__class__(
+                self._config,
+                task=self.task,
+                int_dtype=self.int_dtype,
+                float_dtype=self.float_dtype,
+                behavior=behavior,
+                preprocessors=self._preprocessors,
+            )
+
+        raise ValueError(f"Unsupported behavior: {behavior}")
+
+    def get_model_for_behavior(self, model, behavior):
+        behavior = self._as_behavior(behavior)
+        if behavior == VLMConfigBehavior.TEXT_EMBEDDINGS:
+            emb = model.language_model.get_input_embeddings()
+            emb.config = model.config
+            return emb
+        return model
+
+    def patch_model_for_export(self, model, model_kwargs=None):
+        model_kwargs = model_kwargs or {}
+        b = self._behavior.value if isinstance(self._behavior, VLMConfigBehavior) else str(self._behavior)
+
+        if b == VLMConfigBehavior.VISION_EMBEDDINGS.value:
+            return MllamaVisionEmbeddingsModelPatcher(self, model, model_kwargs=model_kwargs)
+
+        if b == VLMConfigBehavior.LANGUAGE.value:
+            return MllamaLanguageModelPatcher(self, model, model_kwargs=model_kwargs)
+
+        return super().patch_model_for_export(model, model_kwargs)
+
+    @property
+    def inputs(self):
+        b = self._behavior.value if isinstance(self._behavior, VLMConfigBehavior) else str(self._behavior)
+        cfg = self._config
+
+        if b == VLMConfigBehavior.VISION_EMBEDDINGS.value:
+            return {
+                "pixel_values": {0: "batch_size"},
+                "aspect_ratio_ids": {0: "batch_size"},
+                "aspect_ratio_mask": {0: "batch_size"},
+            }
+
+        if b == VLMConfigBehavior.LANGUAGE.value:
+            cross_layers = _mllama_cross_layers(cfg)
+            self_layers = _mllama_self_layers(cfg)
+
+            inputs = {
+                "inputs_embeds": {0: "batch_size", 1: "query_length"},
+                "attention_mask": {0: "batch_size", 1: "total_length"},
+                "position_ids": {0: "batch_size", 1: "query_length"},
+                "cross_attention_mask": {0: "batch_size", 2: "query_length"},
+                "cache_position": {0: "query_length"},
+                "full_text_row_masked_out_mask": {0: "batch_size", 2: "query_length"},
+                "past_key_values": {},
+                "cross_attn_key_values": {},
+            }
+
+            return inputs
+
+        return super().inputs
+
+    def ordered_inputs(self, model):
+        if self._behavior != VLMConfigBehavior.LANGUAGE:
+            return super().ordered_inputs(model)
+
+        cfg = self._config
+        cross_layers = _mllama_cross_layers(cfg)
+        self_layers = _mllama_self_layers(cfg)
+
+        from collections import OrderedDict
+        inputs = OrderedDict()
+
+        inputs["inputs_embeds"] = {0: "batch_size", 1: "query_length"}
+        inputs["attention_mask"] = {0: "batch_size", 1: "total_length"}
+        inputs["position_ids"] = {0: "batch_size", 1: "query_length"}
+        inputs["cross_attention_mask"] = {0: "batch_size", 2: "query_length", 3: "cross_kv_len"}
+        inputs["cache_position"] = {0: "query_length"}
+        inputs["full_text_row_masked_out_mask"] = {0: "batch_size", 2: "query_length"}
+
+        # Note: These are export-time names; Python arg is still `past_key_values`
+        for self_id in range(len(self_layers)):
+            inputs[f"past_key_values.{self_id}.key"] = {0: "batch_size", 2: "past_length"}
+            inputs[f"past_key_values.{self_id}.value"] = {0: "batch_size", 2: "past_length"}
+
+        for layer_idx in cross_layers:
+            inputs[f"cross_attn_key_values.{layer_idx}.key"]   = {0:"batch_size", 2:"cross_kv_len"}
+            inputs[f"cross_attn_key_values.{layer_idx}.value"] = {0:"batch_size", 2:"cross_kv_len"}
+
+        return inputs
+
+    @property
+    def outputs(self):
+        b = self._behavior.value if isinstance(self._behavior, VLMConfigBehavior) else str(self._behavior)
+        cfg = self._config
+
+        if b == VLMConfigBehavior.VISION_EMBEDDINGS.value:
+            outs = {}
+            for layer_idx in _mllama_cross_layers(cfg):
+                outs[f"cross_attn_key_values.{layer_idx}.key"] = {0: "batch_size", 2: "cross_kv_len"}
+                outs[f"cross_attn_key_values.{layer_idx}.value"] = {0: "batch_size", 2: "cross_kv_len"}
+            return outs
+
+        if b == VLMConfigBehavior.LANGUAGE.value:
+            self_layers = _mllama_self_layers(cfg)
+            outs = {"logits": {0: "batch_size", 1: "query_length"}}
+            for self_id in range(len(self_layers)):
+                outs[f"present.{self_id}.key"] = {0: "batch_size", 2: "total_length"}
+                outs[f"present.{self_id}.value"] = {0: "batch_size", 2: "total_length"}
+            return outs
+
+        return super().outputs
 
 class MambaCacheDummyInputGenerator(DummyInputGenerator):
     """
