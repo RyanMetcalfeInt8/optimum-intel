@@ -346,6 +346,8 @@ class OVModelForVisualCausalLM(OVBaseModel, GenerationMixin):
     export_feature = "image-text-to-text"
     additional_parts = []
     auto_model_class = transformers_auto_class
+    language_model_cls = OVModelWithEmbedForCausalLM
+    vision_model_cls = OVVisionEmbedding
 
     @classproperty
     def _all_ov_model_paths(cls) -> Dict[str, str]:
@@ -396,7 +398,7 @@ class OVModelForVisualCausalLM(OVBaseModel, GenerationMixin):
         if quantization_config:
             self._openvino_config = OVConfig(quantization_config=quantization_config)
         self._set_ov_config_parameters()
-        self.language_model = OVModelWithEmbedForCausalLM(
+        self.language_model = self.language_model_cls(
             language_model,
             text_embeddings,
             config=config,
@@ -407,7 +409,7 @@ class OVModelForVisualCausalLM(OVBaseModel, GenerationMixin):
             compile=self._compile_only or enable_compilation,
             compile_only=self._compile_only,
         )
-        self.vision_embeddings = OVVisionEmbedding(vision_embeddings, self)
+        self.vision_embeddings = self.vision_model_cls(vision_embeddings, self)
         for part in self.additional_parts:
             model_part = getattr(self, f"{part}_model", None)
             if model_part is not None:
@@ -4398,7 +4400,75 @@ class _OVLlama4ForCausalLM(OVModelForVisualCausalLM):
         inputs = processor(images=image, text=text_prompt, return_tensors="pt")
         return inputs
 
+class OVModelWithEmbedAndExtraInputsForCausalLM(OVModelWithEmbedForCausalLM):
+    """
+    Same as OVModelWithEmbedForCausalLM, but with some additional inputs, and ability
+    to explicitly set cross_attn states.
+    """
+
+    EXTRA_INPUT_NAMES = {
+        "cross_attention_mask",
+        "full_text_row_masked_out_mask",
+        "cache_position"
+    }
+
+    def prepare_inputs(self, *args, **kwargs):
+        inputs = super().prepare_inputs(*args, **kwargs)
+
+        # pass through extra tensors if the OV model expects them
+        for name in self.EXTRA_INPUT_NAMES:
+            if name in self.input_names and name in kwargs and kwargs[name] is not None:
+                v = kwargs[name]
+                # the rest of this file mostly uses numpy for OV inputs
+                if isinstance(v, torch.Tensor):
+                    v = v.detach().cpu().numpy()
+                inputs[name] = v
+
+        return inputs
+
+    def set_cross_attn_key_values(self, cross_attn_key_values):
+        for name, tens in cross_attn_key_values.items():
+            self.request.set_tensor(name, ov.Tensor(tens))
+
+def is_cross_attn_key_value_name(name):
+    return "cross_attn" in name and ("key" in name or "value" in name)
+
+class OVMllamaVisionEncoder(OVModelPart):
+    _model_name = "vision_embeddings"
+
+    def __init__(self, model: ov.Model, parent_model: OVBaseModel) -> None:
+        super().__init__(model, parent_model, model_name=self._model_name)
+        self.output_dtypes = {key.get_any_name(): key.get_element_type().get_type_name() for key in self.model.outputs}
+        self.output_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.outputs)}
+        self.input_names = {key.get_any_name(): idx for idx, key in enumerate(self.model.inputs)}
+        self.cross_attn_outputs = [key.get_any_name() for key in self.model.outputs if is_cross_attn_key_value_name(key.get_any_name())]
+
+    def forward(self, pixel_values, aspect_ratio_ids, aspect_ratio_mask):
+        self.compile()
+        if pixel_values is not None:
+            if aspect_ratio_ids is None:
+                raise ValueError("`aspect_ratio_ids` must be provided if `pixel_values` is provided")
+
+            if aspect_ratio_mask is None:
+                raise ValueError("`aspect_ratio_mask` must be provided if `pixel_values` is provided")
+
+            inputs = {"pixel_values": pixel_values, "aspect_ratio_ids": aspect_ratio_ids, "aspect_ratio_mask": aspect_ratio_mask}
+            result = self.request(inputs)
+
+            cross_attn_key_values = {}
+            for name in self.cross_attn_outputs:
+                cross_attn_key_values[name] = result[name]
+
+            return cross_attn_key_values
+
 class _OVMllamaForCausalLM(OVModelForVisualCausalLM):
+    """
+    mllama: The main difference between mllama and other supported VLMs, is that vision features are fed as cross-attention states,
+            not merged into token embeddings.
+    """
+    language_model_cls = OVModelWithEmbedAndExtraInputsForCausalLM
+    vision_model_cls = OVMllamaVisionEncoder
+
     def __init__(
         self,
         language_model: ov.Model,
@@ -4424,6 +4494,164 @@ class _OVMllamaForCausalLM(OVModelForVisualCausalLM):
             quantization_config=quantization_config,
             **kwargs,
         )
+        self.num_patches = (self.config.vision_config.image_size // self.config.vision_config.patch_size) ** 2 + 1
+
+    def forward(
+        self,
+        input_ids,
+        pixel_values=None,
+        aspect_ratio_ids=None,
+        aspect_ratio_mask=None,
+        cross_attention_mask=None,
+        past_key_values=None,
+        attention_mask=None,
+        position_ids=None,
+        inputs_embeds=None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ):
+        if pixel_values is not None:
+            cross_attn_key_values  = self.vision_embeddings(pixel_values, aspect_ratio_ids, aspect_ratio_mask)
+            self.language_model.set_cross_attn_key_values(cross_attn_key_values)
+
+        cross_attention_mask, full_text_row_masked_out_mask = self._prepare_cross_attention_mask(
+            cross_attention_mask,
+            past_key_values=past_key_values,
+            num_vision_tokens=self.num_patches,
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        if cross_attention_mask is not None and cache_position is not None:
+            cross_attention_mask = cross_attention_mask[:, :, cache_position]
+            full_text_row_masked_out_mask = full_text_row_masked_out_mask[:, :, cache_position]
+
+        return self.language_model.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            cross_attention_mask=cross_attention_mask,
+            full_text_row_masked_out_mask=full_text_row_masked_out_mask,
+            past_key_values=past_key_values,
+            cache_position=cache_position,
+            **kwargs,
+        )
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids=None,
+        inputs_embeds=None,
+        attention_mask=None,
+        position_ids=None,
+        pixel_values=None,
+        aspect_ratio_ids=None,
+        aspect_ratio_mask=None,
+        cross_attention_mask=None,
+        past_key_values=None,
+        use_cache=False,
+        cache_position=None,
+        cross_attn_key_values=None,
+        num_logits_to_keep=None,
+        **kwargs,
+    ):
+        # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens
+        # Exception 1: when passing input_embeds, input_ids may be missing entries
+        # Exception 2: some generation methods do special slicing of input_ids, so we don't need to do it here
+        if past_key_values is not None:
+            if inputs_embeds is not None:  # Exception 1
+                input_ids = input_ids[:, -cache_position.shape[0] :]
+            elif input_ids.shape[1] != cache_position.shape[0]:  # Default case (the "else", a no op, is Exception 2)
+                input_ids = input_ids[:, cache_position]
+
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        # The clone here is for the same reason as for `position_ids`.
+        model_inputs = {"input_ids": input_ids, "inputs_embeds": None}
+
+        if num_logits_to_keep is not None:
+            model_inputs["num_logits_to_keep"] = num_logits_to_keep
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+                "attention_mask": attention_mask,
+                "cross_attention_mask": cross_attention_mask,
+                "cross_attn_key_values": cross_attn_key_values,
+            }
+        )
+
+        # If we're in pre-fill or cacheless decoding step, then we need pixel_values and aspect ratios
+        # to compute image hidden states, otherwise they are cached within each cross attn layer
+        if (input_ids == self.config.image_token_index).any():
+            model_inputs["pixel_values"] = pixel_values
+            model_inputs["aspect_ratio_ids"] = aspect_ratio_ids
+            model_inputs["aspect_ratio_mask"] = aspect_ratio_mask
+
+        return model_inputs
+
+    def _update_model_kwargs_for_generation(self, outputs, model_kwargs, is_encoder_decoder, **kwargs):
+        cross_attention_mask_prev = model_kwargs.get("cross_attention_mask", None)
+        model_kwargs = super()._update_model_kwargs_for_generation(
+            outputs=outputs,
+            model_kwargs=model_kwargs,
+            is_encoder_decoder=is_encoder_decoder,
+            **kwargs,
+        )
+
+        # add cross-attn mask for new token
+        if cross_attention_mask_prev is not None:
+            model_kwargs["cross_attention_mask"] = torch.cat(
+                [cross_attention_mask_prev, cross_attention_mask_prev[:, -1:, ...]], dim=1
+            )
+        return model_kwargs
+
+    def _prepare_cross_attention_mask(
+        self,
+        cross_attention_mask: torch.Tensor,
+        past_key_values: tuple,
+        num_vision_tokens: int,
+        device: str,
+        dtype: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if cross_attention_mask is None:
+            # should we raise error or prepare a full attn mask with all ones?
+            return None, None
+        else:
+            # reshape so it can be used by attn module
+            batch_size, text_total_length, *_ = cross_attention_mask.shape
+            cross_attention_mask = cross_attention_mask.repeat_interleave(num_vision_tokens, dim=3)
+            cross_attention_mask = cross_attention_mask.view(batch_size, text_total_length, -1)
+            cross_attention_mask = cross_attention_mask.unsqueeze(1)
+
+        # invert the mask
+        inverted_cross_attn_mask = (1.0 - cross_attention_mask).to(dtype)
+        cross_attention_mask = inverted_cross_attn_mask.masked_fill(inverted_cross_attn_mask.to(torch.bool), torch.finfo(dtype).min)
+
+        # apply full-row bias, which return 4D tensor of shape [B, H, S1, 1] where value is 0 if the a full row in cross attn mask's
+        # last dimension contains negative infinity values, otherwise it's 1
+        negative_inf_value = torch.finfo(dtype).min
+        full_text_row_masked_out_mask = (cross_attention_mask != negative_inf_value).any(dim=-1).type_as(cross_attention_mask)[..., None]
+        cross_attention_mask *= full_text_row_masked_out_mask
+
+        # In case we receive a new image but already have previous cross-attention key/values in cache,
+        # then we need to extend the attention-mask and add previous images' lengths
+        #if past_key_values is not None and cross_attention_states is not None and cross_attention_layers is not None:
+        #    # make all zeros mask for cross-attn-mask from previuos cached hidden_states, all zeros right?
+        #    # i.e. extend current cross-attn-mask on image-seq-length dimension to account for past_seen_tokens
+        #    past_cross_attn_kv_length = cross_attention_layers[0].shape[-2]
+        #    past_cross_attn_mask = torch.zeros((*cross_attention_mask.shape[:-1], past_cross_attn_kv_length), dtype=dtype, device=device)
+        #    # concatenate both on image-seq-length dimension
+        #    cross_attention_mask = torch.cat([past_cross_attn_mask, cross_attention_mask], dim=-1)
+
+        return cross_attention_mask, full_text_row_masked_out_mask
 
     @staticmethod
     def preprocess_inputs(
@@ -4433,12 +4661,15 @@ class _OVMllamaForCausalLM(OVModelForVisualCausalLM):
         tokenizer: Optional[PreTrainedTokenizer] = None,
         config: Optional[PretrainedConfig] = None,
         video: Optional["VideoInput"] = None,
+        audio: Optional[np.ndarray] = None,
     ):
         if processor is None:
             raise ValueError("Processor is required.")
-
         if video is not None:
-            raise ValueError("video input is not supported")
+            raise ValueError("Video input is not supported")
+        if audio is not None:
+            raise ValueError("Audio input is not supported")
+
         conversation = [
             {
                 "role": "user",
@@ -4447,12 +4678,11 @@ class _OVMllamaForCausalLM(OVModelForVisualCausalLM):
                 ],
             }
         ]
+
         if image is not None:
             conversation[0]["content"].insert(0, {"type": "image"})
-
         text_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
-
-        inputs = processor(images=image, text=text_prompt, return_tensors="pt")
+        inputs = processor(images=image, text=text_prompt, videos=video, return_tensors="pt")
         return inputs
 
 MODEL_TYPE_TO_CLS_MAPPING = {
