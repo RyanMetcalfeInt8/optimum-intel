@@ -4495,6 +4495,7 @@ class _OVMllamaForCausalLM(OVModelForVisualCausalLM):
             **kwargs,
         )
         self.num_patches = (self.config.vision_config.image_size // self.config.vision_config.patch_size) ** 2 + 1
+        self.cross_attn_key_values = None
 
     def forward(
         self,
@@ -4510,8 +4511,19 @@ class _OVMllamaForCausalLM(OVModelForVisualCausalLM):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ):
+        if past_key_values is None:
+            self.cross_attn_key_values = None
+
         if pixel_values is not None:
             cross_attn_key_values  = self.vision_embeddings(pixel_values, aspect_ratio_ids, aspect_ratio_mask)
+            #todo: we may need to merge these cross_attn_key_values with previous. Just overwrite it for now.
+            self.cross_attn_key_values = cross_attn_key_values
+            self.language_model.set_cross_attn_key_values(cross_attn_key_values)
+
+        elif self.cross_attn_key_values is None:
+            batch_size = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
+            cross_attn_key_values = self._make_dummy_cross_attn_key_values(batch_size, self.device, dtype=torch.float32)
+            self.cross_attn_key_values = cross_attn_key_values
             self.language_model.set_cross_attn_key_values(cross_attn_key_values)
 
         cross_attention_mask, full_text_row_masked_out_mask = self._prepare_cross_attention_mask(
@@ -4550,7 +4562,6 @@ class _OVMllamaForCausalLM(OVModelForVisualCausalLM):
         past_key_values=None,
         use_cache=False,
         cache_position=None,
-        cross_attn_key_values=None,
         num_logits_to_keep=None,
         **kwargs,
     ):
@@ -4583,8 +4594,7 @@ class _OVMllamaForCausalLM(OVModelForVisualCausalLM):
                 "past_key_values": past_key_values,
                 "use_cache": use_cache,
                 "attention_mask": attention_mask,
-                "cross_attention_mask": cross_attention_mask,
-                "cross_attn_key_values": cross_attn_key_values,
+                "cross_attention_mask": cross_attention_mask
             }
         )
 
@@ -4612,6 +4622,21 @@ class _OVMllamaForCausalLM(OVModelForVisualCausalLM):
                 [cross_attention_mask_prev, cross_attention_mask_prev[:, -1:, ...]], dim=1
             )
         return model_kwargs
+
+    def _make_dummy_cross_attn_key_values(self, batch_size: int, device, dtype=torch.float32):
+        cross_kv_heads = self.config.text_config.num_attention_heads
+        head_dim = self.config.text_config.hidden_size // cross_kv_heads
+
+        kv_shape = (batch_size, cross_kv_heads, 1, head_dim)
+        dummy_k = torch.zeros(kv_shape, dtype=dtype, device=device)
+        dummy_v = torch.zeros(kv_shape, dtype=dtype, device=device)
+
+        cross_attn_key_values = {}
+        for layer in self.config.text_config.cross_attention_layers:
+            cross_attn_key_values[f"cross_attn.{layer}.key"] = dummy_k.numpy()
+            cross_attn_key_values[f"cross_attn.{layer}.value"] = dummy_v.numpy()
+
+        return cross_attn_key_values
 
     def _prepare_cross_attention_mask(
         self,
@@ -4681,8 +4706,18 @@ class _OVMllamaForCausalLM(OVModelForVisualCausalLM):
 
         if image is not None:
             conversation[0]["content"].insert(0, {"type": "image"})
+
         text_prompt = processor.apply_chat_template(conversation, add_generation_prompt=True)
         inputs = processor(images=image, text=text_prompt, videos=video, return_tensors="pt")
+
+        if "cross_attention_mask" not in inputs:
+            input_ids = inputs["input_ids"]
+            cross_attention_mask = torch.from_numpy(np.zeros(
+                shape=(input_ids.shape[0], input_ids.shape[1], 1, config.vision_config.max_num_tiles),
+                dtype=np.int64,
+            ))
+            inputs["cross_attention_mask"] = cross_attention_mask
+
         return inputs
 
 MODEL_TYPE_TO_CLS_MAPPING = {
