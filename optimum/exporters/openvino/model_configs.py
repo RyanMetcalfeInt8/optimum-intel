@@ -4329,9 +4329,9 @@ class MllamaOpenVINOConfig(BaseVLMOpenVINOConfig):
 
         if b == VLMConfigBehavior.VISION_EMBEDDINGS.value:
             return {
-                "pixel_values": {0: "batch_size"},
-                "aspect_ratio_ids": {0: "batch_size"},
-                "aspect_ratio_mask": {0: "batch_size"},
+                "pixel_values": {0: "batch_size", 1: "num_images"},
+                "aspect_ratio_ids": {0: "batch_size", 1: "num_images"},
+                "aspect_ratio_mask": {0: "batch_size", 1: "num_images"},
             }
 
         if b == VLMConfigBehavior.LANGUAGE.value:
