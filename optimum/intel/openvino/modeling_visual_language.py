@@ -4408,8 +4408,6 @@ class OVModelWithEmbedAndExtraInputsForCausalLM(OVModelWithEmbedForCausalLM):
 
     EXTRA_INPUT_NAMES = {
         "cross_attention_mask",
-        "full_text_row_masked_out_mask",
-        "cache_position"
     }
 
     def prepare_inputs(self, *args, **kwargs):
@@ -4508,7 +4506,6 @@ class _OVMllamaForCausalLM(OVModelForVisualCausalLM):
         attention_mask=None,
         position_ids=None,
         inputs_embeds=None,
-        cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ):
         if past_key_values is None:
@@ -4526,26 +4523,12 @@ class _OVMllamaForCausalLM(OVModelForVisualCausalLM):
             self.cross_attn_key_values = cross_attn_key_values
             self.language_model.set_cross_attn_key_values(cross_attn_key_values)
 
-        cross_attention_mask, full_text_row_masked_out_mask = self._prepare_cross_attention_mask(
-            cross_attention_mask,
-            past_key_values=past_key_values,
-            num_vision_tokens=self.num_patches,
-            device=self.device,
-            dtype=torch.float32,
-        )
-
-        if cross_attention_mask is not None and cache_position is not None:
-            cross_attention_mask = cross_attention_mask[:, :, cache_position]
-            full_text_row_masked_out_mask = full_text_row_masked_out_mask[:, :, cache_position]
-
         return self.language_model.forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             cross_attention_mask=cross_attention_mask,
-            full_text_row_masked_out_mask=full_text_row_masked_out_mask,
             past_key_values=past_key_values,
-            cache_position=cache_position,
             **kwargs,
         )
 
@@ -4637,46 +4620,6 @@ class _OVMllamaForCausalLM(OVModelForVisualCausalLM):
             cross_attn_key_values[f"cross_attn.{layer}.value"] = dummy_v.numpy()
 
         return cross_attn_key_values
-
-    def _prepare_cross_attention_mask(
-        self,
-        cross_attention_mask: torch.Tensor,
-        past_key_values: tuple,
-        num_vision_tokens: int,
-        device: str,
-        dtype: str,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if cross_attention_mask is None:
-            # should we raise error or prepare a full attn mask with all ones?
-            return None, None
-        else:
-            # reshape so it can be used by attn module
-            batch_size, text_total_length, *_ = cross_attention_mask.shape
-            cross_attention_mask = cross_attention_mask.repeat_interleave(num_vision_tokens, dim=3)
-            cross_attention_mask = cross_attention_mask.view(batch_size, text_total_length, -1)
-            cross_attention_mask = cross_attention_mask.unsqueeze(1)
-
-        # invert the mask
-        inverted_cross_attn_mask = (1.0 - cross_attention_mask).to(dtype)
-        cross_attention_mask = inverted_cross_attn_mask.masked_fill(inverted_cross_attn_mask.to(torch.bool), torch.finfo(dtype).min)
-
-        # apply full-row bias, which return 4D tensor of shape [B, H, S1, 1] where value is 0 if the a full row in cross attn mask's
-        # last dimension contains negative infinity values, otherwise it's 1
-        negative_inf_value = torch.finfo(dtype).min
-        full_text_row_masked_out_mask = (cross_attention_mask != negative_inf_value).any(dim=-1).type_as(cross_attention_mask)[..., None]
-        cross_attention_mask *= full_text_row_masked_out_mask
-
-        # In case we receive a new image but already have previous cross-attention key/values in cache,
-        # then we need to extend the attention-mask and add previous images' lengths
-        #if past_key_values is not None and cross_attention_states is not None and cross_attention_layers is not None:
-        #    # make all zeros mask for cross-attn-mask from previuos cached hidden_states, all zeros right?
-        #    # i.e. extend current cross-attn-mask on image-seq-length dimension to account for past_seen_tokens
-        #    past_cross_attn_kv_length = cross_attention_layers[0].shape[-2]
-        #    past_cross_attn_mask = torch.zeros((*cross_attention_mask.shape[:-1], past_cross_attn_kv_length), dtype=dtype, device=device)
-        #    # concatenate both on image-seq-length dimension
-        #    cross_attention_mask = torch.cat([past_cross_attn_mask, cross_attention_mask], dim=-1)
-
-        return cross_attention_mask, full_text_row_masked_out_mask
 
     @staticmethod
     def preprocess_inputs(

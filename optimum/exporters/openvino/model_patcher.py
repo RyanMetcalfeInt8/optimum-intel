@@ -6267,8 +6267,6 @@ def _mllama_language_forward_wrap(
     attention_mask=None,
     position_ids=None,
     cross_attention_mask=None,
-    cache_position=None,
-    full_text_row_masked_out_mask=None,
     past_key_values=None,
     cross_attn_key_values=None,
 ):
@@ -6286,6 +6284,22 @@ def _mllama_language_forward_wrap(
             self_cache_id += 1
 
     common_cache = DynamicCache.from_legacy_cache(common_cache)
+
+    past_seen_tokens = common_cache.get_seq_length() if common_cache is not None else 0
+    cache_position = torch.arange(
+        past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+    )
+
+    from transformers.models.mllama.modeling_mllama import _prepare_cross_attention_mask
+
+    cross_attention_mask, full_text_row_masked_out_mask = _prepare_cross_attention_mask(
+        cross_attention_mask,
+        num_vision_tokens=self.vision_model.num_patches,
+        dtype=self.dtype,
+    )
+
+    cross_attention_mask = cross_attention_mask[:, :, cache_position]
+    full_text_row_masked_out_mask = full_text_row_masked_out_mask[:, :, cache_position]
 
     outputs = self.model.language_model(
         inputs_embeds=inputs_embeds,

@@ -4179,6 +4179,8 @@ class DummyMllamaVLLMInputGenerator(DummyTextInputGenerator):
 
         self.cross_layers = _mllama_cross_layers(cfg)
         self.self_layers = _mllama_self_layers(cfg)
+        self.max_tiles = int(getattr(cfg.vision_config, "max_image_tiles", 4))
+        self.num_images = int(kwargs.get("num_images", 1))
 
     def generate(self, input_name: str, framework="pt", int_dtype="int64", float_dtype="fp32"):
         import torch
@@ -4196,18 +4198,12 @@ class DummyMllamaVLLMInputGenerator(DummyTextInputGenerator):
         if input_name == "attention_mask":
             return torch.ones([self.batch_size, total_len], dtype=torch.int64)
 
-        if input_name == "cache_position":
-            return torch.arange(past_len, past_len + q_len, dtype=torch.int64)
-
         if input_name == "position_ids":
             pos = torch.arange(past_len, past_len + q_len, dtype=torch.int64)
             return pos.unsqueeze(0).repeat(self.batch_size, 1)
 
         if input_name == "cross_attention_mask":
-            return torch.zeros([self.batch_size, 1, q_len, self.cross_kv_len], dtype=torch.float32)
-
-        if input_name == "full_text_row_masked_out_mask":
-            return torch.ones([self.batch_size, 1, q_len, 1], dtype=torch.float32)
+            return torch.ones([self.batch_size, total_len, self.num_images, self.max_tiles], dtype=torch.int64)
 
         if input_name == "past_key_values":
             kv = []
@@ -4342,9 +4338,7 @@ class MllamaOpenVINOConfig(BaseVLMOpenVINOConfig):
                 "inputs_embeds": {0: "batch_size", 1: "query_length"},
                 "attention_mask": {0: "batch_size", 1: "total_length"},
                 "position_ids": {0: "batch_size", 1: "query_length"},
-                "cross_attention_mask": {0: "batch_size", 2: "query_length"},
-                "cache_position": {0: "query_length"},
-                "full_text_row_masked_out_mask": {0: "batch_size", 2: "query_length"},
+                "cross_attention_mask": {0: "batch_size", 1: "total_length", 2: "num_images", 3: "max_tiles"},
                 "past_key_values": {},
                 "cross_attn_key_values": {},
             }
@@ -4367,9 +4361,7 @@ class MllamaOpenVINOConfig(BaseVLMOpenVINOConfig):
         inputs["inputs_embeds"] = {0: "batch_size", 1: "query_length"}
         inputs["attention_mask"] = {0: "batch_size", 1: "total_length"}
         inputs["position_ids"] = {0: "batch_size", 1: "query_length"}
-        inputs["cross_attention_mask"] = {0: "batch_size", 2: "query_length", 3: "cross_kv_len"}
-        inputs["cache_position"] = {0: "query_length"}
-        inputs["full_text_row_masked_out_mask"] = {0: "batch_size", 2: "query_length"}
+        inputs["cross_attention_mask"] = {0: "batch_size", 1: "total_length", 2: "num_images", 3: "max_tiles"}
 
         # Note: These are export-time names; Python arg is still `past_key_values`
         for self_id in range(len(self_layers)):
