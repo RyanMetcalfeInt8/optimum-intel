@@ -9994,83 +9994,171 @@ class KokoroModelPatcher(ModelPatcher):
         self._model.forward = self._model._orig_forward
 
 
-class Qwen3TTSTalkerModelWrapper(nn.Module):
-    """Structural holder for the Qwen3-TTS talker decoder stack used during export.
+class Qwen3TTSEmbeddingModelWrapper(nn.Module):
+    """Wraps a Qwen3-TTS embedding module with a stable export signature."""
 
-    It exposes the talker decoder layers and final norm with an export-friendly
-    forward signature whose parameters match the stateless graph inputs
-    (``inputs_embeds``, ``attention_mask``, ``cos``, ``sin``, ``past_key``, ``past_value``).
-    The actual stateless computation is installed by :class:`Qwen3TTSTalkerModelPatcher`.
-    """
-
-    def __init__(self, talker_model):
+    def __init__(self, embedding_module, config):
         super().__init__()
-        self.layers = talker_model.layers
-        self.norm = talker_model.norm
-        self.config = talker_model.config
-        self.num_attention_heads = self.config.num_attention_heads
-        self.num_key_value_heads = self.config.num_key_value_heads
-        self.head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.num_attention_heads)
-        self.scaling = self.head_dim**-0.5
+        self.embedding = embedding_module
+        self.config = config
 
-    def forward(self, inputs_embeds, attention_mask, cos, sin, past_key, past_value):
+    def forward(self, input_ids):
+        return self.embedding(input_ids)
+
+
+class Qwen3TTSTextProjectionModelWrapper(nn.Module):
+    """Wraps Qwen3-TTS text projection with a named tensor input."""
+
+    def __init__(self, projection_module, config):
+        super().__init__()
+        self.projection = projection_module
+        self.config = config
+
+    def forward(self, hidden_states):
+        return self.projection(hidden_states)
+
+
+class Qwen3TTSCodePredictorEmbeddingModelWrapper(nn.Module):
+    """Wrap the Qwen3-TTS code predictor embedding selection logic for export."""
+
+    def __init__(self, code_predictor_model, config):
+        super().__init__()
+        self.code_predictor_model = code_predictor_model
+        self.config = config
+
+    def forward(self, input_ids, generation_steps):
+        all_embeddings = torch.stack(
+            [self.code_predictor_model.get_input_embeddings()[i](input_ids) for i in range(len(self.code_predictor_model.get_input_embeddings()))]
+        )
+        return all_embeddings[generation_steps]
+
+
+class Qwen3TTSSpeakerEncoderModelWrapper(nn.Module):
+    """Wrap the Qwen3-TTS speaker encoder with a stable export signature."""
+
+    def __init__(self, speaker_encoder_model, config):
+        super().__init__()
+        self.speaker_encoder_model = speaker_encoder_model
+        self.config = config
+
+    def forward(self, mel_spectrogram):
+        return self.speaker_encoder_model(mel_spectrogram)
+
+
+class Qwen3TTSTalkerLanguageModelWrapper(nn.Module):
+    """Wrapper for the Qwen3-TTS talker language component."""
+
+    def __init__(self, talker_model, config):
+        super().__init__()
+        self.model = talker_model.model
+        self.codec_head = talker_model.codec_head
+        self.config = config
+
+    def forward(self, attention_mask, position_ids, past_key_values, inputs_embeds):
         raise RuntimeError(
-            "Qwen3TTSTalkerModelWrapper must be used within Qwen3TTSTalkerModelPatcher for OpenVINO export."
+            "Qwen3TTSTalkerLanguageModelWrapper must be used with Qwen3TTSTalkerLanguageModelPatcher."
         )
 
 
-class Qwen3TTSTalkerModelPatcher(ModelPatcher):
-    """Rewrites the Qwen3-TTS talker stack into a stateless, KV-explicit forward.
+def _qwen3_patch_cos_sin_cached_fp32(model):
+    if (
+        hasattr(model, "layers")
+        and hasattr(model.layers[0], "self_attn")
+        and hasattr(model.layers[0].self_attn, "rotary_emb")
+        and hasattr(model.layers[0].self_attn.rotary_emb, "dtype")
+        and hasattr(model.layers[0].self_attn.rotary_emb, "inv_freq")
+        and hasattr(model.layers[0].self_attn.rotary_emb, "max_position_embeddings")
+        and hasattr(model.layers[0].self_attn.rotary_emb, "_set_cos_sin_cache")
+    ):
+        for layer in model.layers:
+            if layer.self_attn.rotary_emb.dtype != torch.float32:
+                layer.self_attn.rotary_emb._set_cos_sin_cache(
+                    seq_len=layer.self_attn.rotary_emb.max_position_embeddings,
+                    device=layer.self_attn.rotary_emb.inv_freq.device,
+                    dtype=torch.float32,
+                )
 
-    The talker decoder (28 layers + final norm) dominates Qwen3-TTS inference. For
-    OpenVINO export it is traced as a stateless graph whose rotary ``cos``/``sin`` and
-    per-layer key/value cache are passed explicitly. The attention/rotary math reuses the
-    ``qwen_tts`` helpers (``rotate_half``, ``eager_attention_forward``) and the model's own
-    weight modules, so nothing is re-implemented.
-    """
+
+class Qwen3TTSTalkerLanguageModelPatcher(ModelPatcher):
+    """Patch Qwen3-TTS talker language model to export logits, hidden states and KV outputs."""
 
     def __init__(self, config, model, model_kwargs=None):
         super().__init__(config, model, model_kwargs)
-        from qwen_tts.core.models.modeling_qwen3_tts import eager_attention_forward, rotate_half
+        _qwen3_patch_cos_sin_cached_fp32(self._model)
+        if hasattr(self._model, "model"):
+            _qwen3_patch_cos_sin_cached_fp32(self._model.model)
 
-        wrapper = self._model
-        num_heads = wrapper.num_attention_heads
-        num_kv = wrapper.num_key_value_heads
-        head_dim = wrapper.head_dim
-        scaling = wrapper.scaling
-
-        def patched_forward(inputs_embeds, attention_mask, cos, sin, past_key, past_value):
-            cos_u = cos.unsqueeze(1)
-            sin_u = sin.unsqueeze(1)
-            hidden = inputs_embeds
-            new_k_list = []
-            new_v_list = []
-            for idx, layer in enumerate(wrapper.layers):
-                attn = layer.self_attn
-                bs, seq, _ = hidden.shape
-                residual = hidden
-                h = layer.input_layernorm(hidden)
-                q = attn.q_norm(attn.q_proj(h).view(bs, seq, num_heads, head_dim)).transpose(1, 2)
-                k = attn.k_norm(attn.k_proj(h).view(bs, seq, num_kv, head_dim)).transpose(1, 2)
-                v = attn.v_proj(h).view(bs, seq, num_kv, head_dim).transpose(1, 2)
-                q = (q * cos_u) + (rotate_half(q) * sin_u)
-                k = (k * cos_u) + (rotate_half(k) * sin_u)
-                new_k_list.append(k)
-                new_v_list.append(v)
-                k = torch.cat([past_key[idx], k], dim=2)
-                v = torch.cat([past_value[idx], v], dim=2)
-                attn_out, _ = eager_attention_forward(attn, q, k, v, attention_mask, scaling)
-                attn_out = attn_out.reshape(bs, seq, -1)
-                attn_out = attn.o_proj(attn_out)
-                hidden = residual + attn_out
-                residual = hidden
-                h = layer.post_attention_layernorm(hidden)
-                hidden = residual + layer.mlp(h)
-            hidden = wrapper.norm(hidden)
-            return {
-                "last_hidden_state": hidden,
-                "present_key": torch.stack(new_k_list, dim=0),
-                "present_value": torch.stack(new_v_list, dim=0),
+        def patched_forward(attention_mask, position_ids, past_key_values, inputs_embeds):
+            pkv = DynamicCache.from_legacy_cache(past_key_values)
+            outputs = self._model.model(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=pkv,
+                inputs_embeds=inputs_embeds,
+                use_cache=True,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            hidden_states = outputs.last_hidden_state
+            logits = self._model.codec_head(hidden_states).float()
+            flat_output = {
+                "logits": logits,
+                "hidden_states": hidden_states,
             }
+            present = outputs.past_key_values.to_legacy_cache()
+            for i, layer_kv in enumerate(present):
+                flat_output[f"present.{i}.key"] = layer_kv[0]
+                flat_output[f"present.{i}.value"] = layer_kv[1]
+            return flat_output
+
+        self.patched_forward = patched_forward
+
+
+class Qwen3TTSCodePredictorStaticModelWrapper(nn.Module):
+    """Wrapper for Qwen3-TTS static all-heads code predictor export."""
+
+    def __init__(self, code_predictor_model, config):
+        super().__init__()
+        self.model = code_predictor_model.model
+        self.small_to_mtp_projection = code_predictor_model.small_to_mtp_projection
+        self.lm_head = code_predictor_model.lm_head
+        self.config = config
+
+    def forward(self, inputs_embeds, attention_mask, position_ids, past_key_values):
+        raise RuntimeError(
+            "Qwen3TTSCodePredictorStaticModelWrapper must be used with Qwen3TTSCodePredictorStaticModelPatcher."
+        )
+
+
+class Qwen3TTSCodePredictorStaticModelPatcher(ModelPatcher):
+    """Patch Qwen3-TTS code predictor to static, single-token, all-heads forward."""
+
+    def __init__(self, config, model, model_kwargs=None):
+        super().__init__(config, model, model_kwargs)
+        _qwen3_patch_cos_sin_cached_fp32(self._model)
+        if hasattr(self._model, "model"):
+            _qwen3_patch_cos_sin_cached_fp32(self._model.model)
+
+        def patched_forward(inputs_embeds, attention_mask, position_ids, past_key_values):
+            pkv = DynamicCache.from_legacy_cache(past_key_values)
+            projected = self._model.small_to_mtp_projection(inputs_embeds)
+            outputs = self._model.model(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=pkv,
+                inputs_embeds=projected,
+                use_cache=True,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            present = outputs.past_key_values.to_legacy_cache()
+            present = tuple((k[:, :, -1:, :], v[:, :, -1:, :]) for (k, v) in present)
+            hidden_states = outputs.last_hidden_state
+            logits = torch.stack([head(hidden_states) for head in self._model.lm_head], dim=0)
+            flat_output = {"logits": logits}
+            for i, layer_kv in enumerate(present):
+                flat_output[f"present.{i}.key"] = layer_kv[0]
+                flat_output[f"present.{i}.value"] = layer_kv[1]
+            return flat_output
 
         self.patched_forward = patched_forward

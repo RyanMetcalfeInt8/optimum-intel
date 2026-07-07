@@ -320,19 +320,74 @@ def _get_qwen3_tts_submodels_fn_and_export_configs(
     custom_export_configs: Dict[str, "OpenVINOConfig"] = None,
     fn_get_submodels: Callable = None,
 ):
-    # Only the heavy talker decoder stack is offloaded to OpenVINO. It is exported as a
-    # stateless graph described by ``Qwen3TTSTalkerOpenVINOConfig`` (dummy inputs + dynamic
-    # axes) and traced through a thin wrapper whose forward signature matches the graph
-    # inputs; the real stateless computation is installed by ``Qwen3TTSTalkerModelPatcher``.
-    from optimum.exporters.openvino.model_configs import Qwen3TTSTalkerOpenVINOConfig
-    from optimum.exporters.openvino.model_patcher import Qwen3TTSTalkerModelWrapper
+    from optimum.exporters.openvino.model_configs import (
+        Qwen3TTSCodePredictorEmbeddingOpenVINOConfig,
+        Qwen3TTSCodePredictorStaticOpenVINOConfig,
+        Qwen3TTSEmbeddingOpenVINOConfig,
+        Qwen3TTSSpeakerEncoderOpenVINOConfig,
+        Qwen3TTSTalkerLanguageOpenVINOConfig,
+        Qwen3TTSTextProjectionOpenVINOConfig,
+    )
+    from optimum.exporters.openvino.model_patcher import (
+        Qwen3TTSCodePredictorEmbeddingModelWrapper,
+        Qwen3TTSCodePredictorStaticModelWrapper,
+        Qwen3TTSEmbeddingModelWrapper,
+        Qwen3TTSSpeakerEncoderModelWrapper,
+        Qwen3TTSTalkerLanguageModelWrapper,
+        Qwen3TTSTextProjectionModelWrapper,
+    )
 
-    talker_model = model.talker.model
-    talker_export_config = Qwen3TTSTalkerOpenVINOConfig(talker_model.config, task="feature-extraction")
-    custom_export_configs = {"talker_model": talker_export_config}
+    talker_config = model.config.talker_config
+    code_predictor_config = talker_config.code_predictor_config
+    custom_export_configs = {
+        "talker_language_model": Qwen3TTSTalkerLanguageOpenVINOConfig(talker_config, task="feature-extraction"),
+        "talker_embedding_model": Qwen3TTSEmbeddingOpenVINOConfig(talker_config, task="feature-extraction"),
+        "talker_text_embedding_model": Qwen3TTSEmbeddingOpenVINOConfig(talker_config, task="feature-extraction"),
+        "talker_text_projection_model": Qwen3TTSTextProjectionOpenVINOConfig(
+            talker_config, task="feature-extraction"
+        ),
+        "talker_code_predictor_embedding_model": Qwen3TTSCodePredictorEmbeddingOpenVINOConfig(
+            code_predictor_config, task="feature-extraction"
+        ),
+        "talker_code_predictor_model": Qwen3TTSCodePredictorStaticOpenVINOConfig(
+            code_predictor_config,
+            task="feature-extraction",
+            embedding_dim=talker_config.hidden_size,
+        ),
+    }
+    if model.config.tts_model_type == "base" and getattr(model, "speaker_encoder", None) is not None:
+        custom_export_configs["speaker_encoder_model"] = Qwen3TTSSpeakerEncoderOpenVINOConfig(
+            model.config.speaker_encoder_config,
+            task="feature-extraction",
+        )
 
     def _get_qwen3_tts_submodels(model):
-        return {"talker_model": Qwen3TTSTalkerModelWrapper(model.talker.model).eval()}
+        submodels = {
+            "talker_language_model": Qwen3TTSTalkerLanguageModelWrapper(model.talker, talker_config).eval(),
+            "talker_embedding_model": Qwen3TTSEmbeddingModelWrapper(
+                model.talker.get_input_embeddings(), talker_config
+            ).eval(),
+            "talker_text_embedding_model": Qwen3TTSEmbeddingModelWrapper(
+                model.talker.get_text_embeddings(), talker_config
+            ).eval(),
+            "talker_text_projection_model": Qwen3TTSTextProjectionModelWrapper(
+                model.talker.text_projection, talker_config
+            ).eval(),
+            "talker_code_predictor_embedding_model": Qwen3TTSCodePredictorEmbeddingModelWrapper(
+                model.talker.code_predictor.model,
+                code_predictor_config,
+            ).eval(),
+            "talker_code_predictor_model": Qwen3TTSCodePredictorStaticModelWrapper(
+                model.talker.code_predictor,
+                code_predictor_config,
+            ).eval(),
+        }
+        if model.config.tts_model_type == "base" and getattr(model, "speaker_encoder", None) is not None:
+            submodels["speaker_encoder_model"] = Qwen3TTSSpeakerEncoderModelWrapper(
+                model.speaker_encoder,
+                model.config.speaker_encoder_config,
+            ).eval()
+        return submodels
 
     fn_get_submodels = _get_qwen3_tts_submodels
 
