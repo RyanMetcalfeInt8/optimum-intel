@@ -6113,14 +6113,23 @@ class Qwen3TTSSpeakerEncoderOpenVINOConfig(OpenVINOConfig):
 
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
-        return {"mel_spectrogram": {0: "batch_size", 1: "sequence_length", 2: "mel_dim"}}
+        # Keep batch and mel_dim static to match Qwen3 speaker encoder tracing behavior
+        # and avoid shape-specialized internal branches on dynamic batch.
+        return {"mel_spectrogram": {1: "sequence_length"}}
 
     @property
     def outputs(self) -> Dict[str, Dict[int, str]]:
         return {"speaker_embedding": {0: "batch_size"}}
 
     def generate_dummy_inputs(self, framework: str = "pt", **kwargs):
-        generator = self.DUMMY_INPUT_GENERATOR_CLASSES[0](self.task, self._normalized_config, **kwargs)
+        # Force batch_size=1 for stable speaker encoder export.
+        kwargs.pop("batch_size", None)
+        generator = self.DUMMY_INPUT_GENERATOR_CLASSES[0](
+            self.task,
+            self._normalized_config,
+            batch_size=1,
+            **kwargs,
+        )
         return {
             "mel_spectrogram": generator.generate(
                 "mel_spectrogram", framework=framework, int_dtype=self.int_dtype, float_dtype=self.float_dtype
