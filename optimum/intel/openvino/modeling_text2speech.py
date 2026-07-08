@@ -14,6 +14,8 @@
 
 import logging
 import os
+import gc
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -35,7 +37,7 @@ from transformers.utils import ModelOutput
 from ...exporters.openvino.stateful import model_has_state
 from . import OV_DECODER_NAME, OV_ENCODER_NAME
 from .configuration import OVConfig, OVWeightQuantizationConfig
-from .modeling_base import OVBaseModel, OVModelPart
+from .modeling_base import OVBaseModel, OVModelHostMixin, OVModelPart
 from .modeling_seq2seq import (
     INPUTS_DOCSTRING,
     OVModelForSeq2SeqLM,
@@ -947,11 +949,40 @@ def _is_qwen3_tts_config(config: Optional["PretrainedConfig"]) -> bool:
     return "Qwen3TTSForConditionalGeneration" in architectures
 
 
-class _OVModelForQwen3TTS:
+class _OVModelForQwen3TTS(OVModelHostMixin):
     """OpenVINO-backed runtime for Qwen3-TTS."""
 
     export_feature = "text-to-audio"
     main_input_name = "input_ids"
+
+    @classproperty
+    def _all_ov_model_paths(cls) -> Dict[str, str]:
+        # Keep names aligned with exporter outputs.
+        return {
+            "talker_language_model": "openvino_talker_language_model.xml",
+            "talker_embedding_model": "openvino_talker_embedding_model.xml",
+            "talker_text_embedding_model": "openvino_talker_text_embedding_model.xml",
+            "talker_text_projection_model": "openvino_talker_text_projection_model.xml",
+            "talker_code_predictor_embedding_model": "openvino_talker_code_predictor_embedding_model.xml",
+            "talker_code_predictor_model": "openvino_talker_code_predictor_model.xml",
+            "speaker_encoder_model": "openvino_speaker_encoder_model.xml",
+            "speech_tokenizer_encoder_model": "speech_tokenizer/openvino_speech_tokenizer_encoder_model.xml",
+            "speech_tokenizer_decoder_model": "speech_tokenizer/openvino_speech_tokenizer_decoder_model.xml",
+        }
+
+    @classmethod
+    def _discover_ov_model_paths(cls, model_save_dir: Union[str, Path]) -> Dict[str, str]:
+        root = Path(model_save_dir)
+        paths = {}
+        for ov_model_name, relpath in cls._all_ov_model_paths.items():
+            if (root / relpath).exists() and (root / relpath).with_suffix(".bin").exists():
+                paths[ov_model_name] = relpath
+        if not paths:
+            raise FileNotFoundError(
+                f"No OpenVINO submodels were found under {root}. "
+                "Expected exported Qwen3-TTS OpenVINO files to be present."
+            )
+        return paths
 
     def __init__(self, ov_qwen3_tts_model, config: "PretrainedConfig", model_save_dir=None, **kwargs):
         self._ov_qwen3_tts = ov_qwen3_tts_model
@@ -961,6 +992,133 @@ class _OVModelForQwen3TTS:
         self.model_save_dir = model_save_dir
         self._device = "CPU"
         self.sampling_rate = 24000
+        self._compile_only = False
+        self.ov_config = {}
+        self._openvino_config = None
+        self.preprocessors = kwargs.get("preprocessors", [])
+
+        self.__ov_model_paths = self._discover_ov_model_paths(model_save_dir)
+        for ov_model_name in self.__ov_model_paths:
+            setattr(self, ov_model_name, None)
+
+    @property
+    def _ov_model_names(self) -> List[str]:
+        return list(self.__ov_model_paths.keys())
+
+    @property
+    def _ov_model_paths(self) -> Dict[str, str]:
+        return self.__ov_model_paths
+
+    @property
+    def ov_models(self) -> Dict[str, openvino.Model]:
+        root = Path(self.model_save_dir)
+        models = {}
+        for ov_model_name, relpath in self._ov_model_paths.items():
+            model = getattr(self, ov_model_name, None)
+            if model is None:
+                model = OVBaseModel.load_model(root / relpath)
+                setattr(self, ov_model_name, model)
+            models[ov_model_name] = model
+        return models
+
+    def clear_requests(self):
+        # Runtime wrappers compile lazily per component; no shared request to clear here.
+        return
+
+    def compile(self):
+        # Qwen3-TTS runtime compiles component requests lazily on first use.
+        return
+
+    def _set_ov_config_parameters(self):
+        if self.ov_config.get("PERFORMANCE_HINT") is None:
+            self.ov_config["PERFORMANCE_HINT"] = "LATENCY"
+
+    def _preprocess_quantization_config(self, quantization_config, model_name_or_path: str):
+        return quantization_config
+
+    def _apply_quantization(
+        self,
+        quantization_config,
+        compile_only: bool,
+        compile_model: bool,
+        model_name_or_path: str,
+        trust_remote_code: Optional[bool] = False,
+        **kwargs,
+    ):
+        from optimum.intel.utils.import_utils import is_nncf_available
+
+        from .configuration import OVWeightQuantizationConfig, _quantization_config_from_dict
+        from .quantization import _weight_only_quantization
+
+        if compile_only:
+            raise ValueError(
+                "quantization is not supported with `compile_only` mode, please initialize model without this option"
+            )
+
+        if not is_nncf_available():
+            raise ImportError("Quantization of the weights requires nncf, please install it with `pip install nncf`")
+
+        if isinstance(quantization_config, dict):
+            quantization_config = _quantization_config_from_dict(quantization_config)
+
+        if not isinstance(quantization_config, OVWeightQuantizationConfig):
+            raise ValueError(
+                "Qwen3-TTS currently supports only weight-only quantization in OpenVINO export. "
+                f"Got {type(quantization_config)}."
+            )
+
+        save_directory = kwargs.get("save_directory", None)
+        immediate_save = kwargs.get("immediate_save", False)
+        if save_directory is None:
+            raise ValueError("`save_directory` must be provided for Qwen3-TTS quantization.")
+        if not immediate_save:
+            raise ValueError(
+                "Qwen3-TTS quantization currently requires `immediate_save=True` to safely overwrite multi-file IRs."
+            )
+
+        save_directory = Path(save_directory)
+
+        # Release runtime-side compiled models before replacing IR files in-place.
+        runtime_model = getattr(self, "_ov_qwen3_tts", None)
+        self._ov_qwen3_tts = None
+        self.model = None
+        del runtime_model
+        gc.collect()
+
+        for ov_model_name in self._ov_model_names:
+            ov_model = self.ov_models[ov_model_name]
+            quantized_model = _weight_only_quantization(ov_model, quantization_config, verify_not_optimized=False)
+            self.replace_ov_model(ov_model, quantized_model)
+
+            temporary_directory = TemporaryDirectory()
+            try:
+                temp_model_path = Path(temporary_directory.name) / "model.xml"
+                openvino.save_model(quantized_model, str(temp_model_path), compress_to_fp16=False)
+
+                # Release loaded models before replacing files on Windows.
+                self._unload_ov_model(quantized_model)
+                del quantized_model
+                del ov_model
+
+                output_model_path = save_directory / Path(self._ov_model_paths[ov_model_name])
+                output_model_path.parent.mkdir(parents=True, exist_ok=True)
+                if output_model_path.exists():
+                    output_model_path.unlink()
+                output_bin_path = output_model_path.with_suffix(".bin")
+                if output_bin_path.exists():
+                    output_bin_path.unlink()
+
+                shutil.move(str(temp_model_path), str(output_model_path))
+                shutil.move(str(temp_model_path.with_suffix(".bin")), str(output_bin_path))
+            finally:
+                temporary_directory.cleanup()
+
+        self._openvino_config = OVConfig(quantization_config=quantization_config)
+        self._set_ov_config_parameters()
+        self._openvino_config.save_pretrained(save_directory)
+
+        if compile_model:
+            self.compile()
 
     @classmethod
     def from_pretrained(
@@ -1098,3 +1256,7 @@ class _OVModelForQwen3TTS:
         if return_sample_rate:
             return output, int(sr)
         return output
+
+    def forward(self, *args, **kwargs):
+        """OVQuantizer expects a forward method on OV model wrappers."""
+        return self.generate(*args, **kwargs)
