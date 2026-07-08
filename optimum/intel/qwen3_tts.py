@@ -257,6 +257,14 @@ class OVQwen3TTSTalkerCodePredictorModelForConditionalGeneration(GenerationMixin
         compiled_model = core.compile_model(self.model, device, config={"ACTIVATIONS_SCALE_FACTOR": "8.0"} if device == "GPU" else {})
         self.request = compiled_model.create_infer_request()
 
+        # Detect the static all-heads export (explicit fixed-size KV cache) vs the
+        # legacy dynamic export (generation_steps scalar + mid_residual_hiddens).
+        # The static model is driven host-side, one token at a time, mirroring the
+        # C++ text2speech pipeline (infer_predictor / generate_codec_groups).
+        self.is_static = any(name.startswith("past_key_values") for name in self.input_names)
+        if self.is_static:
+            self._init_static_predictor_meta()
+
         # Create embedding wrapper
         self.get_input_embeddings = lambda: self._embedding_wrapper
         self._embedding_wrapper = self._create_embedding_wrapper()
@@ -385,6 +393,182 @@ class OVQwen3TTSTalkerCodePredictorModelForConditionalGeneration(GenerationMixin
 
     def _get_past_length(self, past_key_values=None):
         return self._past_length if past_key_values else 0
+
+    # ------------------------------------------------------------------
+    # Static all-heads code predictor (explicit fixed-size KV cache).
+    # Host-driven, single-token execution mirroring the C++ pipeline
+    # (init_static_predictor_meta / infer_predictor / generate_codec_groups).
+    # ------------------------------------------------------------------
+    def _init_static_predictor_meta(self):
+        """Read static predictor dims from the IR and allocate host KV buffers."""
+
+        def _dim(ps, i):
+            d = ps[i]
+            return int(d.get_length()) if d.is_static else None
+
+        self._pred_num_layers = 0
+        self._pred_n_kv = self._pred_head_dim = None
+        self._pred_past_len = self._pred_kv_len = None
+        for inp in self.model.inputs:
+            name = inp.get_any_name()
+            ps = inp.get_partial_shape()
+            if name == "attention_mask":
+                self._pred_kv_len = _dim(ps, 1)
+            elif name.startswith("past_key_values.") and name.endswith(".key"):
+                self._pred_n_kv = _dim(ps, 1)  # [1, n_kv, past_len, head_dim]
+                self._pred_past_len = _dim(ps, 2)
+                self._pred_head_dim = _dim(ps, 3)
+                self._pred_num_layers += 1
+
+        self._pred_num_heads = self._pred_vocab = None
+        for out in self.model.outputs:
+            if out.get_any_name() == "logits":
+                ps = out.get_partial_shape()  # [num_heads, 1, 1, vocab]
+                self._pred_num_heads = _dim(ps, 0)
+                self._pred_vocab = _dim(ps, 3)
+
+        # Fall back to derived values when an export left some dims dynamic.
+        if self._pred_num_heads is None:
+            self._pred_num_heads = int(self.config.num_code_groups) - 1
+        if self._pred_past_len is None:
+            self._pred_past_len = self._pred_num_heads
+        if self._pred_kv_len is None:
+            self._pred_kv_len = self._pred_past_len + 1
+
+        assert self._pred_num_layers > 0 and self._pred_n_kv and self._pred_head_dim, (
+            f"Unexpected static code predictor shapes: layers={self._pred_num_layers} "
+            f"n_kv={self._pred_n_kv} head_dim={self._pred_head_dim}"
+        )
+
+        kv_shape = (1, self._pred_n_kv, self._pred_past_len, self._pred_head_dim)
+        self._pred_past_k = [np.zeros(kv_shape, dtype=np.float32) for _ in range(self._pred_num_layers)]
+        self._pred_past_v = [np.zeros(kv_shape, dtype=np.float32) for _ in range(self._pred_num_layers)]
+        self._pred_position = 0
+
+    def reset_state(self):
+        """Reset predictor cache: static zeroes host KV; dynamic resets OV state."""
+        if getattr(self, "is_static", False):
+            self._reset_predictor_state()
+        else:
+            self.request.reset_state()
+
+    def _reset_predictor_state(self):
+        for i in range(self._pred_num_layers):
+            self._pred_past_k[i].fill(0.0)
+            self._pred_past_v[i].fill(0.0)
+        self._pred_position = 0
+
+    def _infer_predictor_static(self, inputs_embeds, reset):
+        """Run one token through the static predictor and update the host KV cache."""
+        if reset:
+            self._reset_predictor_state()
+
+        p = self._pred_position
+        assert p < self._pred_past_len + 1, f"static code predictor KV window exceeded (position {p})"
+
+        emb = inputs_embeds.numpy() if isinstance(inputs_embeds, torch.Tensor) else inputs_embeds
+        emb = np.ascontiguousarray(emb, dtype=np.float32)
+
+        # Valid kv slots: the p real past tokens (0..p-1) plus the current token,
+        # which the graph appends at slot index past_len (= kv_len - 1).
+        attn = np.zeros((1, self._pred_kv_len), dtype=np.int64)
+        attn[0, :p] = 1
+        attn[0, self._pred_past_len] = 1
+        pos = np.array([[p]], dtype=np.int64)  # current token RoPE position
+
+        inputs = {"inputs_embeds": emb, "attention_mask": attn, "position_ids": pos}
+        for i in range(self._pred_num_layers):
+            inputs[f"past_key_values.{i}.key"] = self._pred_past_k[i]
+            inputs[f"past_key_values.{i}.value"] = self._pred_past_v[i]
+
+        self.request.start_async(inputs, share_inputs=False)
+        self.request.wait()
+
+        logits = self.request.get_tensor("logits").data.copy()  # [num_heads, 1, 1, vocab]
+
+        # Store freshly produced token into host past slot p for next step.
+        if p < self._pred_past_len:
+            for i in range(self._pred_num_layers):
+                pk = self.request.get_tensor(f"present.{i}.key").data
+                pv = self.request.get_tensor(f"present.{i}.value").data
+                src = pk.shape[2] - 1
+                self._pred_past_k[i][:, :, p, :] = pk[:, :, src, :]
+                self._pred_past_v[i][:, :, p, :] = pv[:, :, src, :]
+
+        self._pred_position += 1
+        return torch.from_numpy(logits)
+
+    @staticmethod
+    def _select_predictor_head(all_logits, head):
+        # all_logits: [num_heads, 1, 1, vocab] -> [1, 1, vocab] for one head.
+        return all_logits[head]
+
+    @staticmethod
+    def _sample_static(logits, do_sample, top_k, top_p, temperature):
+        """Temperature / top-k / top-p sampling over a single [.., vocab] logits row."""
+        flat = torch.as_tensor(logits).float().reshape(-1)
+        if not do_sample:
+            return int(torch.argmax(flat).item())
+        if temperature and temperature > 0:
+            flat = flat / temperature
+
+        if top_k and top_k > 0:
+            k = min(int(top_k), flat.shape[-1])
+            vals, idx = torch.topk(flat, k)
+            probs = torch.softmax(vals, dim=-1)
+        else:
+            idx = torch.arange(flat.shape[-1])
+            probs = torch.softmax(flat, dim=-1)
+
+        if top_p and top_p < 1.0:
+            sp, order = torch.sort(probs, descending=True)
+            keep = torch.cumsum(sp, dim=-1) <= top_p
+            keep[0] = True
+            sp = sp[keep]
+            sel = order[keep]
+            choice = sel[torch.multinomial(sp, 1)]
+            return int(idx[choice].item())
+
+        choice = torch.multinomial(probs, 1)
+        return int(idx[choice].item())
+
+    def _generate_static(
+        self,
+        inputs_embeds=None,
+        max_new_tokens=None,
+        do_sample=True,
+        top_p=None,
+        top_k=None,
+        temperature=1.0,
+        **kwargs,
+    ):
+        """Host-driven residual codec generation against static all-heads model."""
+        assert inputs_embeds is not None, "static code predictor requires inputs_embeds"
+        n_residual = int(max_new_tokens)  # == num_code_groups - 1 == num_heads
+
+        # Prefill context token-by-token; last prefill logits predict group 1.
+        logits = None
+        for t in range(inputs_embeds.shape[1]):
+            tok = inputs_embeds[:, t : t + 1, :]
+            logits = self._infer_predictor_static(tok, reset=(t == 0))
+
+        # Group 1 from head 0.
+        seqs = [self._sample_static(self._select_predictor_head(logits, 0), do_sample, top_k, top_p, temperature)]
+        for g in range(1, n_residual):
+            # Embed previous residual, advance one position, read next head.
+            emb = self.get_input_embeddings()(torch.tensor([[seqs[-1]]], dtype=torch.long), g - 1)
+            logits = self._infer_predictor_static(emb, reset=False)
+            head_g = self._select_predictor_head(logits, g)
+            seqs.append(self._sample_static(head_g, do_sample, top_k, top_p, temperature))
+
+        sequences = torch.tensor([seqs], dtype=torch.long)
+        return types.SimpleNamespace(sequences=sequences, hidden_states=None)
+
+    def generate(self, *args, **kwargs):
+        """Static export: host-driven loop. Legacy dynamic export: HF GenerationMixin."""
+        if getattr(self, "is_static", False):
+            return self._generate_static(*args, **kwargs)
+        return super().generate(*args, **kwargs)
 
 
 class OVQwen3TTSTalkerForConditionalGeneration(GenerationMixin):
@@ -1828,7 +2012,7 @@ class OVQwen3TTSModel:
         for idx in range(batch_size):
             # Reset KV cache states
             self.talker.request.reset_state()
-            self.talker.code_predictor.request.reset_state()
+            self.talker.code_predictor.reset_state()
             self.talker.rope_deltas = None
 
             input_id = input_ids[idx]
