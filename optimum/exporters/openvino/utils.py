@@ -324,6 +324,8 @@ def _get_qwen3_tts_submodels_fn_and_export_configs(
         Qwen3TTSCodePredictorEmbeddingOpenVINOConfig,
         Qwen3TTSCodePredictorStaticOpenVINOConfig,
         Qwen3TTSEmbeddingOpenVINOConfig,
+        Qwen3TTSSpeechTokenizerDecoderOpenVINOConfig,
+        Qwen3TTSSpeechTokenizerEncoderOpenVINOConfig,
         Qwen3TTSSpeakerEncoderOpenVINOConfig,
         Qwen3TTSTalkerLanguageOpenVINOConfig,
         Qwen3TTSTextProjectionOpenVINOConfig,
@@ -332,6 +334,8 @@ def _get_qwen3_tts_submodels_fn_and_export_configs(
         Qwen3TTSCodePredictorEmbeddingModelWrapper,
         Qwen3TTSCodePredictorStaticModelWrapper,
         Qwen3TTSEmbeddingModelWrapper,
+        Qwen3TTSSpeechTokenizerDecoderModelWrapper,
+        Qwen3TTSSpeechTokenizerEncoderModelWrapper,
         Qwen3TTSSpeakerEncoderModelWrapper,
         Qwen3TTSTalkerLanguageModelWrapper,
         Qwen3TTSTextProjectionModelWrapper,
@@ -361,6 +365,18 @@ def _get_qwen3_tts_submodels_fn_and_export_configs(
             task="feature-extraction",
         )
 
+    speech_tokenizer = getattr(model, "speech_tokenizer", None)
+    speech_tokenizer_model = getattr(speech_tokenizer, "model", speech_tokenizer)
+    if speech_tokenizer_model is not None and getattr(speech_tokenizer_model, "config", None) is not None:
+        custom_export_configs["speech_tokenizer_encoder_model"] = Qwen3TTSSpeechTokenizerEncoderOpenVINOConfig(
+            speech_tokenizer_model.config,
+            task="feature-extraction",
+        )
+        custom_export_configs["speech_tokenizer_decoder_model"] = Qwen3TTSSpeechTokenizerDecoderOpenVINOConfig(
+            speech_tokenizer_model.config,
+            task="feature-extraction",
+        )
+
     def _get_qwen3_tts_submodels(model):
         submodels = {
             "talker_language_model": Qwen3TTSTalkerLanguageModelWrapper(model.talker, talker_config).eval(),
@@ -386,6 +402,24 @@ def _get_qwen3_tts_submodels_fn_and_export_configs(
             submodels["speaker_encoder_model"] = Qwen3TTSSpeakerEncoderModelWrapper(
                 model.speaker_encoder,
                 model.config.speaker_encoder_config,
+            ).eval()
+        speech_tokenizer = getattr(model, "speech_tokenizer", None)
+        speech_tokenizer_model = getattr(speech_tokenizer, "model", speech_tokenizer)
+        if speech_tokenizer_model is not None and hasattr(speech_tokenizer_model, "encoder") and hasattr(speech_tokenizer_model, "decoder"):
+            valid_num_quantizers = getattr(speech_tokenizer_model, "encoder_valid_num_quantizers", None)
+            if valid_num_quantizers is None and hasattr(speech_tokenizer_model, "config"):
+                valid_num_quantizers = getattr(speech_tokenizer_model.config, "encoder_valid_num_quantizers", None)
+            if valid_num_quantizers is None and hasattr(speech_tokenizer_model, "config"):
+                decoder_cfg = getattr(speech_tokenizer_model.config, "decoder_config", None)
+                valid_num_quantizers = getattr(decoder_cfg, "num_quantizers", 16)
+
+            submodels["speech_tokenizer_encoder_model"] = Qwen3TTSSpeechTokenizerEncoderModelWrapper(
+                speech_tokenizer_model.encoder,
+                int(valid_num_quantizers),
+            ).eval()
+            submodels["speech_tokenizer_decoder_model"] = Qwen3TTSSpeechTokenizerDecoderModelWrapper(
+                speech_tokenizer_model.decoder,
+                getattr(speech_tokenizer_model, "config", None),
             ).eval()
         return submodels
 

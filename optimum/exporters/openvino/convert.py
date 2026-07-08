@@ -785,6 +785,8 @@ def export_from_model(
             TALKER_LANGUAGE_NAME,
             TALKER_TEXT_EMBEDDING_NAME,
             TALKER_TEXT_PROJECTION_NAME,
+            SPEECH_TOKENIZER_DECODER_NAME,
+            SPEECH_TOKENIZER_ENCODER_NAME,
             SPEAKER_ENCODER_NAME,
         )
 
@@ -801,6 +803,11 @@ def export_from_model(
         if model.config.tts_model_type == "base" and getattr(model, "speaker_encoder", None) is not None:
             files_subpaths.append(SPEAKER_ENCODER_NAME)
             stateful_submodels.append(False)
+        speech_tokenizer = getattr(model, "speech_tokenizer", None)
+        if speech_tokenizer is not None and getattr(speech_tokenizer, "config", None) is not None:
+            files_subpaths.append(os.path.join("speech_tokenizer", SPEECH_TOKENIZER_ENCODER_NAME))
+            files_subpaths.append(os.path.join("speech_tokenizer", SPEECH_TOKENIZER_DECODER_NAME))
+            stateful_submodels.extend([False, False])
     elif library_name != "diffusers":
         if is_transformers_version("<", "5"):
             # some model configs may have issues with loading without parameters initialization
@@ -887,55 +894,6 @@ def export_from_model(
         patch_16bit_model=patch_16bit_model,
         library_name=library_name,
     )
-
-    if library_name == "qwen3_tts":
-        from ...intel.qwen3_tts import (
-            SPEAKER_ENCODER_NAME,
-            SPEECH_TOKENIZER_DECODER_NAME,
-            SPEECH_TOKENIZER_ENCODER_NAME,
-            TALKER_CODE_PREDICTOR_EMBEDDING_NAME,
-            TALKER_CODE_PREDICTOR_NAME,
-            TALKER_EMBEDDING_NAME,
-            TALKER_LANGUAGE_NAME,
-            TALKER_TEXT_EMBEDDING_NAME,
-            TALKER_TEXT_PROJECTION_NAME,
-            convert_qwen3_tts_model,
-        )
-
-        model_id = getattr(model, "_qwen3_tts_repo_id", None)
-        if model_id is None:
-            raise ValueError("Qwen3-TTS export requires `_qwen3_tts_repo_id` on the loaded model.")
-
-        if ov_config is not None and getattr(ov_config, "quantization_config", None):
-            logger.warning(
-                "Qwen3-TTS export ignores OVConfig quantization_config. Use dedicated Qwen3-TTS compression settings."
-            )
-
-        convert_qwen3_tts_model(
-            model_id=model_id,
-            output_dir=output,
-            quantization_config=None,
-            use_local_dir=False,
-        )
-
-        files_subpaths = [
-            TALKER_LANGUAGE_NAME,
-            TALKER_EMBEDDING_NAME,
-            TALKER_TEXT_EMBEDDING_NAME,
-            TALKER_TEXT_PROJECTION_NAME,
-            TALKER_CODE_PREDICTOR_EMBEDDING_NAME,
-            TALKER_CODE_PREDICTOR_NAME,
-        ]
-        optional = [
-            SPEAKER_ENCODER_NAME,
-            os.path.join("speech_tokenizer", SPEECH_TOKENIZER_ENCODER_NAME),
-            os.path.join("speech_tokenizer", SPEECH_TOKENIZER_DECODER_NAME),
-        ]
-        for relpath in optional:
-            if (output / relpath).exists():
-                files_subpaths.append(relpath)
-
-        return files_subpaths
 
     return files_subpaths
 

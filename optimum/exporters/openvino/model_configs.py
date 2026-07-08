@@ -156,6 +156,7 @@ from optimum.exporters.openvino.model_patcher import (
     Qwen3_5MoeModelPatcher,
     Qwen3_5VisionEmbMergerPatcher,
     Qwen3TTSCodePredictorStaticModelPatcher,
+    Qwen3TTSSpeechTokenizerModelPatcher,
     Qwen3ASRModelPatcher,
     Qwen3MoeModelPatcher,
     Qwen3NextModelPatcher,
@@ -5938,6 +5939,90 @@ class Qwen3TTSEmbeddingOpenVINOConfig(OpenVINOConfig):
     @property
     def outputs(self) -> Dict[str, Dict[int, str]]:
         return {"embeddings": {0: "batch_size", 1: "sequence_length"}}
+
+
+class Qwen3TTSSpeechTokenizerEncoderDummyInputGenerator(DummyInputGenerator):
+    SUPPORTED_INPUT_NAMES = ("input_values",)
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedConfig,
+        batch_size: int = 1,
+        channels: int = 1,
+        sequence_length: int = 24000,
+        **kwargs,
+    ):
+        self.task = task
+        self.normalized_config = normalized_config
+        self.batch_size = batch_size
+        self.channels = channels
+        self.sequence_length = sequence_length
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        if input_name != "input_values":
+            raise ValueError(f"Unsupported input name {input_name} for {self.__class__.__name__}")
+        return self.random_float_tensor(
+            [self.batch_size, self.channels, self.sequence_length], framework=framework, dtype=float_dtype
+        )
+
+
+class Qwen3TTSSpeechTokenizerEncoderOpenVINOConfig(OpenVINOConfig):
+    NORMALIZED_CONFIG_CLASS = NormalizedConfig
+    DUMMY_INPUT_GENERATOR_CLASSES = (Qwen3TTSSpeechTokenizerEncoderDummyInputGenerator,)
+    _MODEL_PATCHER = Qwen3TTSSpeechTokenizerModelPatcher
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {"input_values": {0: "batch_size", 1: "channels", 2: "sequence_length"}}
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {"audio_codes": {0: "batch_size", 2: "code_length"}}
+
+
+class Qwen3TTSSpeechTokenizerDecoderDummyInputGenerator(DummyInputGenerator):
+    SUPPORTED_INPUT_NAMES = ("audio_codes",)
+
+    def __init__(
+        self,
+        task: str,
+        normalized_config: NormalizedConfig,
+        batch_size: int = 1,
+        code_length: int = 256,
+        **kwargs,
+    ):
+        self.task = task
+        self.normalized_config = normalized_config
+        self.batch_size = batch_size
+        self.code_length = code_length
+        config = normalized_config.config
+        decoder_cfg = getattr(config, "decoder_config", config)
+        self.num_quantizers = getattr(decoder_cfg, "num_quantizers", 16)
+
+    def generate(self, input_name: str, framework: str = "pt", int_dtype: str = "int64", float_dtype: str = "fp32"):
+        if input_name != "audio_codes":
+            raise ValueError(f"Unsupported input name {input_name} for {self.__class__.__name__}")
+        return self.random_int_tensor(
+            [self.batch_size, self.code_length, self.num_quantizers],
+            max_value=2048,
+            framework=framework,
+            dtype=int_dtype,
+        )
+
+
+class Qwen3TTSSpeechTokenizerDecoderOpenVINOConfig(OpenVINOConfig):
+    NORMALIZED_CONFIG_CLASS = NormalizedConfig
+    DUMMY_INPUT_GENERATOR_CLASSES = (Qwen3TTSSpeechTokenizerDecoderDummyInputGenerator,)
+    _MODEL_PATCHER = Qwen3TTSSpeechTokenizerModelPatcher
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        return {"audio_codes": {0: "batch_size", 1: "code_length", 2: "num_quantizers"}}
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        return {"audio_values": {0: "batch_size", 1: "audio_length"}}
 
 
 class Qwen3TTSCodePredictorEmbeddingDummyInputGenerator(DummyInputGenerator):

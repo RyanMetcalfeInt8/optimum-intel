@@ -10045,6 +10045,32 @@ class Qwen3TTSSpeakerEncoderModelWrapper(nn.Module):
         return self.speaker_encoder_model(mel_spectrogram)
 
 
+class Qwen3TTSSpeechTokenizerEncoderModelWrapper(nn.Module):
+    """Wrap the Qwen3-TTS speech-tokenizer encoder for export."""
+
+    def __init__(self, encoder_model, valid_num_quantizers):
+        super().__init__()
+        self.encoder_model = encoder_model
+        self.valid_num_quantizers = valid_num_quantizers
+
+    def forward(self, input_values):
+        encoded = self.encoder_model.encode(input_values=input_values, return_dict=True)
+        return encoded.audio_codes[:, : self.valid_num_quantizers]
+
+
+class Qwen3TTSSpeechTokenizerDecoderModelWrapper(nn.Module):
+    """Wrap the Qwen3-TTS speech-tokenizer decoder for export."""
+
+    def __init__(self, decoder_model, config):
+        super().__init__()
+        self.decoder_model = decoder_model
+        self.config = config
+
+    def forward(self, audio_codes):
+        wav = self.decoder_model(audio_codes.transpose(1, 2))
+        return wav.squeeze(1).clamp(min=-1, max=1)
+
+
 class Qwen3TTSTalkerLanguageModelWrapper(nn.Module):
     """Wrapper for the Qwen3-TTS talker language component."""
 
@@ -10058,6 +10084,148 @@ class Qwen3TTSTalkerLanguageModelWrapper(nn.Module):
         raise RuntimeError(
             "Qwen3TTSTalkerLanguageModelWrapper must be used with Qwen3TTSTalkerLanguageModelPatcher."
         )
+
+
+def _qwen3_speech_tokenizer_dynamic_layer_update(
+    self, key_states: torch.Tensor, value_states: torch.Tensor, cache_kwargs: Optional[Dict[str, Any]] = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if self.keys is None:
+        self.keys = key_states
+        self.values = value_states
+        self.device = key_states.device
+        self.dtype = key_states.dtype
+        self.is_initialized = True
+    else:
+        self.keys = torch.cat([self.keys, key_states], dim=-2)
+        self.values = torch.cat([self.values, value_states], dim=-2)
+    return self.keys, self.values
+
+
+class Qwen3TTSSpeechTokenizerModelPatcher(ModelPatcher):
+    """Apply scoped masking/cache patches needed for stable speech-tokenizer tracing."""
+
+    def __enter__(self):
+        super().__enter__()
+
+        self._masking_utils = None
+        self._orig_find_packed = None
+        self._orig_sdpa_mask = None
+        self._orig_eager_mask = None
+
+        self._dynamic_layer_cls = None
+        self._orig_dynamic_layer_update = None
+
+        self._orig_causal_mask = None
+        self._orig_sliding_window_causal_mask = None
+
+        self._qwen_tokenizer_module = None
+        self._orig_qwen_causal_mask = None
+        self._orig_qwen_sliding_window_causal_mask = None
+
+        try:
+            import transformers.masking_utils as _masking_utils
+
+            self._masking_utils = _masking_utils
+            if hasattr(_masking_utils, "find_packed_sequence_indices"):
+                self._orig_find_packed = _masking_utils.find_packed_sequence_indices
+
+                def _patched_find_packed_sequence_indices(position_ids):
+                    first_val = position_ids[:, :1] - 1
+                    prepended = torch.cat([first_val, position_ids], dim=-1)
+                    position_diff = prepended[:, 1:] - prepended[:, :-1]
+                    return (position_diff != 1).cumsum(-1)
+
+                _masking_utils.find_packed_sequence_indices = _patched_find_packed_sequence_indices
+
+            if "ALL_MASK_ATTENTION_FUNCTIONS" in globals():
+                self._orig_sdpa_mask = getattr(_masking_utils, "sdpa_mask", None)
+                self._orig_eager_mask = getattr(_masking_utils, "eager_mask", None)
+                ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa", eager_mask_without_vmap)
+                ALL_MASK_ATTENTION_FUNCTIONS.register("eager", eager_mask_without_vmap)
+
+            self._orig_causal_mask = getattr(_masking_utils, "create_causal_mask", None)
+            self._orig_sliding_window_causal_mask = getattr(_masking_utils, "create_sliding_window_causal_mask", None)
+
+            def _simple_causal_mask(**kwargs):
+                input_embeds = kwargs["input_embeds"]
+                batch_size, seq_len = input_embeds.shape[0], input_embeds.shape[1]
+                dtype = input_embeds.dtype
+                mask = torch.triu(
+                    torch.full((seq_len, seq_len), torch.finfo(dtype).min, dtype=dtype, device=input_embeds.device),
+                    diagonal=1,
+                )
+                return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
+
+            def _simple_sliding_window_causal_mask(**kwargs):
+                config = kwargs["config"]
+                input_embeds = kwargs["input_embeds"]
+                batch_size, seq_len = input_embeds.shape[0], input_embeds.shape[1]
+                dtype = input_embeds.dtype
+                window_size = getattr(config, "sliding_window", None) or 72
+                mask = torch.triu(
+                    torch.full((seq_len, seq_len), torch.finfo(dtype).min, dtype=dtype, device=input_embeds.device),
+                    diagonal=1,
+                )
+                sliding_mask = torch.tril(
+                    torch.full((seq_len, seq_len), torch.finfo(dtype).min, dtype=dtype, device=input_embeds.device),
+                    diagonal=-(window_size),
+                )
+                mask = mask + sliding_mask
+                return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
+
+            if self._orig_causal_mask is not None:
+                _masking_utils.create_causal_mask = _simple_causal_mask
+            if self._orig_sliding_window_causal_mask is not None:
+                _masking_utils.create_sliding_window_causal_mask = _simple_sliding_window_causal_mask
+        except Exception:
+            self._masking_utils = None
+
+        try:
+            from transformers.cache_utils import DynamicLayer
+
+            self._dynamic_layer_cls = DynamicLayer
+            self._orig_dynamic_layer_update = DynamicLayer.update
+            DynamicLayer.update = _qwen3_speech_tokenizer_dynamic_layer_update
+        except Exception:
+            self._dynamic_layer_cls = None
+
+        try:
+            import qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 as _qwen_modeling
+
+            self._qwen_tokenizer_module = _qwen_modeling
+            self._orig_qwen_causal_mask = getattr(_qwen_modeling, "create_causal_mask", None)
+            self._orig_qwen_sliding_window_causal_mask = getattr(_qwen_modeling, "create_sliding_window_causal_mask", None)
+
+            if self._orig_qwen_causal_mask is not None and self._masking_utils is not None:
+                _qwen_modeling.create_causal_mask = self._masking_utils.create_causal_mask
+            if self._orig_qwen_sliding_window_causal_mask is not None and self._masking_utils is not None:
+                _qwen_modeling.create_sliding_window_causal_mask = self._masking_utils.create_sliding_window_causal_mask
+        except Exception:
+            self._qwen_tokenizer_module = None
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+
+        if self._masking_utils is not None:
+            if self._orig_find_packed is not None:
+                self._masking_utils.find_packed_sequence_indices = self._orig_find_packed
+            if self._orig_sdpa_mask is not None and "ALL_MASK_ATTENTION_FUNCTIONS" in globals():
+                ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa", self._orig_sdpa_mask)
+            if self._orig_eager_mask is not None and "ALL_MASK_ATTENTION_FUNCTIONS" in globals():
+                ALL_MASK_ATTENTION_FUNCTIONS.register("eager", self._orig_eager_mask)
+            if self._orig_causal_mask is not None:
+                self._masking_utils.create_causal_mask = self._orig_causal_mask
+            if self._orig_sliding_window_causal_mask is not None:
+                self._masking_utils.create_sliding_window_causal_mask = self._orig_sliding_window_causal_mask
+
+        if self._dynamic_layer_cls is not None and self._orig_dynamic_layer_update is not None:
+            self._dynamic_layer_cls.update = self._orig_dynamic_layer_update
+
+        if self._qwen_tokenizer_module is not None:
+            if self._orig_qwen_causal_mask is not None:
+                self._qwen_tokenizer_module.create_causal_mask = self._orig_qwen_causal_mask
+            if self._orig_qwen_sliding_window_causal_mask is not None:
+                self._qwen_tokenizer_module.create_sliding_window_causal_mask = self._orig_qwen_sliding_window_causal_mask
 
 
 def _qwen3_patch_cos_sin_cached_fp32(model):
