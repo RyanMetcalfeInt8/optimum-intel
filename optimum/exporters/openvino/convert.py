@@ -566,14 +566,13 @@ def _save_kokoro_config_and_assets(model, output: Path):
 
 
 def _save_qwen3_tts_config_and_assets(model, output: Path):
-    """Materialize the original Qwen3-TTS repository files alongside the talker IR.
+    """Materialize Qwen3-TTS runtime assets alongside the exported OpenVINO IR.
 
     The OpenVINO runtime (:class:`optimum.intel.openvino.modeling_text2speech._OVModelForQwen3TTS`)
-    rebuilds the full ``qwen_tts`` pipeline from these files and loads the exported
-    ``openvino_talker_model.xml`` for the offloaded decoder stack, so every original file
-    (configs, tokenizer, weights, processor assets) must be present in ``output``. OpenVINO
-    IR files that already live in the source directory are skipped to avoid clobbering the
-    freshly exported graph.
+    rebuilds the ``qwen_tts`` pipeline from files in ``output`` and loads the exported
+    OpenVINO submodels for the decoder stack. To keep outputs consistent with standard
+    Optimum OpenVINO exports, heavyweight training checkpoints are excluded while runtime
+    configs/tokenizer assets are preserved.
     """
     import shutil
 
@@ -584,10 +583,31 @@ def _save_qwen3_tts_config_and_assets(model, output: Path):
     output = Path(output)
     src = Path(repo_id)
     skip_names = {".git", ".cache", "openvino_talker_model.xml", "openvino_talker_model.bin"}
+    skip_suffixes = {
+        ".safetensors",
+        ".pt",
+        ".pth",
+        ".ckpt",
+        ".onnx",
+        ".msgpack",
+    }
+    skip_glob_patterns = [
+        "*.safetensors.index.json",
+        "pytorch_model*.bin",
+        "model*.bin",
+    ]
+
+    def _should_skip(item: Path) -> bool:
+        name = item.name
+        if name in skip_names:
+            return True
+        if item.suffix in skip_suffixes:
+            return True
+        return any(item.match(pattern) for pattern in skip_glob_patterns)
 
     if src.is_dir():
         for item in src.iterdir():
-            if item.name in skip_names:
+            if _should_skip(item):
                 continue
             dest = output / item.name
             if item.is_dir():
@@ -602,7 +622,19 @@ def _save_qwen3_tts_config_and_assets(model, output: Path):
         snapshot_download(
             repo_id=str(repo_id),
             local_dir=str(output),
-            ignore_patterns=["openvino_talker_model.xml", "openvino_talker_model.bin"],
+            ignore_patterns=[
+                "openvino_talker_model.xml",
+                "openvino_talker_model.bin",
+                "*.safetensors",
+                "*.safetensors.index.json",
+                "*.pt",
+                "*.pth",
+                "*.ckpt",
+                "*.onnx",
+                "*.msgpack",
+                "pytorch_model*.bin",
+                "model*.bin",
+            ],
         )
 
 
