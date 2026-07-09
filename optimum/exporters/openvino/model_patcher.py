@@ -10281,6 +10281,39 @@ class Qwen3TTSTalkerLanguageModelPatcher(ModelPatcher):
 
         self.patched_forward = patched_forward
 
+    def __enter__(self):
+        super().__enter__()
+        self._orig_sdpa_mask = None
+        self._orig_eager_mask = None
+
+        if is_transformers_version(">=", "4.53"):
+            try:
+                import transformers.masking_utils as _masking_utils
+
+                self._orig_sdpa_mask = getattr(_masking_utils, "sdpa_mask", None)
+                self._orig_eager_mask = getattr(_masking_utils, "eager_mask", None)
+            except Exception:
+                pass
+
+            # Match standalone exporter behavior: force float eager-style masks
+            # for both eager and sdpa paths during tracing/export.
+            ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa", eager_mask_without_vmap)
+            ALL_MASK_ATTENTION_FUNCTIONS.register("eager", eager_mask_without_vmap)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+
+        if is_transformers_version(">=", "4.53"):
+            if self._orig_sdpa_mask is not None:
+                ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa", self._orig_sdpa_mask)
+            else:
+                ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa", sdpa_mask)
+
+            if self._orig_eager_mask is not None:
+                ALL_MASK_ATTENTION_FUNCTIONS.register("eager", self._orig_eager_mask)
+            else:
+                ALL_MASK_ATTENTION_FUNCTIONS.register("eager", eager_mask)
+
 
 class Qwen3TTSCodePredictorStaticModelWrapper(nn.Module):
     """Wrapper for Qwen3-TTS static all-heads code predictor export."""
@@ -10330,3 +10363,35 @@ class Qwen3TTSCodePredictorStaticModelPatcher(ModelPatcher):
             return flat_output
 
         self.patched_forward = patched_forward
+
+    def __enter__(self):
+        super().__enter__()
+        self._orig_sdpa_mask = None
+        self._orig_eager_mask = None
+
+        if is_transformers_version(">=", "4.53"):
+            try:
+                import transformers.masking_utils as _masking_utils
+
+                self._orig_sdpa_mask = getattr(_masking_utils, "sdpa_mask", None)
+                self._orig_eager_mask = getattr(_masking_utils, "eager_mask", None)
+            except Exception:
+                pass
+
+            # Keep SDPA mask input in float domain for exported IR (NPU-safe).
+            ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa", eager_mask_without_vmap)
+            ALL_MASK_ATTENTION_FUNCTIONS.register("eager", eager_mask_without_vmap)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)
+
+        if is_transformers_version(">=", "4.53"):
+            if self._orig_sdpa_mask is not None:
+                ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa", self._orig_sdpa_mask)
+            else:
+                ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa", sdpa_mask)
+
+            if self._orig_eager_mask is not None:
+                ALL_MASK_ATTENTION_FUNCTIONS.register("eager", self._orig_eager_mask)
+            else:
+                ALL_MASK_ATTENTION_FUNCTIONS.register("eager", eager_mask)
