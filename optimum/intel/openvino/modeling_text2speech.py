@@ -1367,7 +1367,6 @@ def compress_qwen3_tts_irs(ir_dir, quantization_config, output_dir=None) -> None
 
     ir_dir = Path(ir_dir)
     output_dir = Path(output_dir) if output_dir is not None else ir_dir
-    core = openvino.Core()
 
     requested_bits = (
         quantization_config.get("bits") if isinstance(quantization_config, dict) else quantization_config.bits
@@ -1390,7 +1389,9 @@ def compress_qwen3_tts_irs(ir_dir, quantization_config, output_dir=None) -> None
             config = fallback_config
         bits = config.get("bits") if isinstance(config, dict) else config.bits
         logger.info(f"Qwen3-TTS: applying {bits}-bit weight compression to {ir_name}.")
-        compressed = _weight_only_quantization(core.read_model(ir_path), config)
+        core = openvino.Core()
+        source_model = core.read_model(ir_path)
+        compressed = _weight_only_quantization(source_model, config)
 
         # The source weights are still memory-mapped, both by the model this method was
         # called on and by ``read_model`` above, so the compressed graph is written under a
@@ -1399,6 +1400,8 @@ def compress_qwen3_tts_irs(ir_dir, quantization_config, output_dir=None) -> None
         staged_xml = output_dir / f"{ir_path.stem}.compressed.xml"
         save_model(compressed, staged_xml, compress_to_fp16=False)
         del compressed
+        del source_model
+        del core
         gc.collect()
 
         target_xml = output_dir / ir_name
@@ -1873,6 +1876,21 @@ class _OVModelForQwen3TTS:
         :data:`_QWEN3_TTS_INT4_OV_IR_NAMES` are quantized to 4 bits, the rest fall back to 8,
         so `--weight-format int4` yields a mixed int4/int8 model.
         """
+        # The live runtime wires component forwards to closures that capture compiled OpenVINO
+        # models. On Windows those handles can keep the source .bin mapped and block the final
+        # in-place replacement with WinError 5. Drop the runtime object graph before rewriting
+        # the IR files; `_main_quantize` does not reuse this instance afterward.
+        self._pipeline = None
+        self.model = None
+        self.processor = None
+        self._ov_talker = None
+        self._ov_code_predictor = None
+        self._ov_embeddings = None
+        self._ov_speaker_encoder = None
+        self._ov_codec_encoder = None
+        self._ov_codec_decoder = None
+        gc.collect()
+
         compress_qwen3_tts_irs(
             self._ir_dir,
             quantization_config,
